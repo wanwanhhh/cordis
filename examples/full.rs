@@ -24,7 +24,7 @@ impl Plugin for LoggerPlugin {
             let logger = ctx.require::<Arc<RwLock<Logger>>>()?;
             logger.read().unwrap().log("ready");
             Ok(())
-        });
+        })?;
 
         Ok(())
     }

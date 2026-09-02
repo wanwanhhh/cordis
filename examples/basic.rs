@@ -17,7 +17,7 @@ impl Plugin for LoggerPlugin {
             let logger = ctx.require::<Logger>()?;
             println!("ready, logger.name = {}", logger.name);
             Ok(())
-        });
+        })?;
 
         Ok(())
     }

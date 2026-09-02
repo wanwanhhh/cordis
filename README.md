@@ -11,9 +11,11 @@ Rust 实现的 Cordis 风格插件化基础架构。
 ## 当前实现
 
 - `Context`
+- `Scope` / 子 Context
 - `Plugin`
 - `ServiceRegistry`
 - 服务注册 / 获取
+- 父级服务继承与局部遮蔽
 - 插件依赖声明与检查
 - `apply` 失败回滚
 - ready / dispose 生命周期

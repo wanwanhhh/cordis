@@ -28,6 +28,9 @@ pub enum Error {
 
     /// 停止阶段发生多个错误。
     Multiple(Vec<Error>),
+
+    /// 上下文已被 Scope 共享，当前不允许可变操作。
+    ContextShared,
 }
 
 impl fmt::Display for Error {
@@ -53,6 +56,10 @@ impl fmt::Display for Error {
                 }
                 Ok(())
             }
+            Error::ContextShared => write!(
+                f,
+                "context is shared by a scope; mutable operations are not allowed"
+            ),
         }
     }
 }

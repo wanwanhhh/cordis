@@ -103,6 +103,7 @@ Plugin B  --require-->  Service
 | `Dependency` | 插件声明的服务依赖 |
 | `Service` | 插件之间共享的能力 |
 | `ServiceRegistry` | 按类型保存服务实例的注册表 |
+| `Scope` | 子上下文；用于隔离插件组，可继承父级服务 |
 | `Error` | 框架统一的错误类型 |
 | `on_ready` | `start()` 阶段结束后产生的回调 |
 | `on_dispose` | `stop()` 阶段结束后产生的回调 |
@@ -175,11 +176,11 @@ impl Context {
     pub fn on_ready(
         &mut self,
         hook: impl FnMut(&mut Context) -> Result<(), Error> + 'static,
-    );
+    ) -> Result<(), Error>;
     pub fn on_dispose(
         &mut self,
         hook: impl FnMut(&mut Context) -> Result<(), Error> + 'static,
-    );
+    ) -> Result<(), Error>;
 
     // 启动/停止
     pub fn start(&mut self) -> Result<(), Error>;
@@ -280,6 +281,164 @@ impl ServiceRegistry {
 
 `contains_type`、`type_ids`、`retain` 目前是 crate 内部方法，
 仅供 `Context` 实现依赖检查与 `apply` 失败回滚使用，不对外暴露。
+
+### 5.4 Scope / 子 Context
+
+#### 定位
+
+`Scope` 是 `Context` 的**私有子作用域**，用于隔离一组插件和服务。
+
+典型用途：
+
+- 会话级插件组
+- 子流程插件组
+- 测试隔离环境
+- 可独立启动/停止的局部模块
+
+`Scope` 不是业务概念，是 Cordis 底层隔离机制。
+
+#### 数据模型（关键设计）
+
+核心设计使用 `Rc` 共享父级状态，避免把生命周期泛型暴露给用户：
+
+```rust
+struct ContextInner {
+    parent: Option<Rc<ContextInner>>,
+    services: ServiceRegistry,
+    plugins: Vec<Box<dyn Plugin>>,
+    ready_hooks: Vec<ReadyHook>,
+    dispose_hooks: Vec<DisposeHook>,
+}
+
+pub struct Context {
+    inner: Rc<ContextInner>,
+}
+
+pub struct Scope {
+    ctx: Context,
+}
+```
+
+要点：
+
+- 根 `Context`：`parent = None`。
+- 子 `Context`：`parent = Some(parent Rc clone)`。
+- `Context::new()` 返回普通 `Context`，不需要写成 `Context<'static>`。
+- `ctx.scope()` 返回 `Scope`，内部通过克隆 `Rc` 共享父级服务。
+- `Scope` 内部插件拿到的 `ctx` 是子 `Context`，因此 `ctx.require` 天然能向上查找。
+
+> 使用 `Rc` 后，`Context` 不包含生命周期参数，
+> 显式写 `let ctx: Context = Context::new()` 也能正常创建 scope，
+> 不会出现 `Context<'static>` 导致的编译失败。
+
+#### 服务解析规则
+
+- `Context::require` 查找顺序：
+  1. 当前 `Context` 局部服务
+  2. 父级 `Context` 服务（递归）
+- 局部服务优先，局部服务会遮蔽父级同名服务。
+- `Context::contains` 同样查找局部 + 父级。
+- `Context::verify_dependencies` 同样检查局部 + 父级。
+- `Context::require_mut` **只允许访问当前子上下文局部服务**；
+  父级服务通过子上下文不可变共享。
+- `Scope::require` 不需要单独实现查找逻辑，直接委托给 `ctx.require`。
+
+#### 服务可见性
+
+明确三条规则：
+
+1. 父上下文看不到 scope 内部服务。
+2. scope 内插件可以看到父上下文服务。
+3. scope 被销毁/停止后，scope 内部服务不再对外可见。
+
+#### 父服务就绪约束
+
+- 创建 `Scope` 时，父上下文中必须已存在所有需要的服务。
+- scope 创建后，父级不能继续通过 `provide` 添加服务；若尝试添加会返回 `Error::ContextShared`。
+- 如果 scope 内部插件依赖父级服务，必须在创建 scope 前完成对应 `provide()`。
+
+#### 可变性约束
+
+- 因为父级内存在 scope 中被共享，scope 存活期间父级执行可变操作会返回 `Error::ContextShared`。
+- 受影响的方法包括：`provide`、`plugin`、`plugins`、`require_mut`、`on_ready`、`on_dispose`、`start`、`stop`。
+- `scope` 销毁后，父级恢复可变操作能力。
+
+#### API 约定
+
+`Context` 新增：
+
+```rust
+pub fn scope(&self) -> Scope;
+```
+
+`Scope` 必须提供与 `Context` 对称的 API 集合：
+
+```rust
+impl Scope {
+    pub fn plugin<P: Plugin + 'static>(&mut self, plugin: P) -> Result<(), Error>;
+    pub fn plugins<I, P>(&mut self, plugins: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = P>,
+        P: Plugin + 'static;
+    pub fn provide<T: 'static>(&mut self, value: T) -> Result<(), Error>;
+
+    // 查询：局部优先，父级兜底
+    pub fn require<T: 'static>(&self) -> Result<&T, Error>;
+    // 仅局部，不可修改父级服务
+    pub fn require_mut<T: 'static>(&mut self) -> Result<&mut T, Error>;
+    // 检查局部 + 父级
+    pub fn contains<T: 'static>(&self) -> bool;
+
+    // 依赖
+    pub fn verify_dependencies(&self) -> Result<(), Error>;
+
+    // 生命周期回调
+    pub fn on_ready(
+        &mut self,
+        hook: impl FnMut(&mut Context) -> Result<(), Error> + 'static,
+    ) -> Result<(), Error>;
+    pub fn on_dispose(
+        &mut self,
+        hook: impl FnMut(&mut Context) -> Result<(), Error> + 'static,
+    ) -> Result<(), Error>;
+
+    // 生命周期
+    pub fn start(&mut self) -> Result<(), Error>;
+    pub fn stop(&mut self) -> Result<(), Error>;
+}
+```
+
+#### 生命周期规则
+
+`Scope` 作为子 `Context`，继承 `Context` 的完整生命周期语义：
+
+- `scope.start()` 只启动 scope 内部插件。
+- `scope.stop()` 只停止 scope 内部插件。
+- 插件 `stop()` 失败时继续逆序停止。
+- dispose hooks 始终执行。
+- 停止错误聚合为 `Error::Multiple`。
+- 重复调用 `start()` / `stop()` 是安全 no-op。
+- 插件 `apply` 失败时，局部服务、hooks、嵌套插件回滚。
+- 父级 `stop()` 不自动清理 scope；scope 生命周期由创建者负责。
+
+#### 所有权与资源责任
+
+- `Scope` 通过 `Rc` 持有父级状态，因此在 scope 存活期间父级不会被释放。
+- scope 存活期间，父级不可变操作不受影响，可变操作返回 `Error::ContextShared`。
+- 创建者必须在弃用 scope 前显式调用 `scope.stop()`。
+- 当前**不承诺** `Drop` 自动执行 `stop()`；资源清理责任在创建者。
+- 若未来引入自动清理，应作为独立能力另行设计，而不是依赖 `Drop` 做不可靠清理。
+
+#### 状态
+
+已按本设计实现，并补充了以下测试：
+
+- scope 内插件生命周期方法可读取父级服务
+- 局部服务遮蔽与作用域隔离
+- scope 依赖检查可看到父级服务
+- scope 独立 start / stop
+- scope 存活期间父级可变操作返回 `Error::ContextShared`
+- 显式 `Context` 类型创建 scope 不依赖生命周期推断
 
 ---
 
@@ -487,6 +646,7 @@ pub enum Error {
     PluginStart(String),
     PluginStop(String),
     Multiple(Vec<Error>),
+    ContextShared,
 }
 ```
 
@@ -497,6 +657,7 @@ pub enum Error {
 - 错误信息应包含具体的服务名或插件名。
 - `ServiceTypeMismatch` 是防御性错误；正常公共 API 不应触发，若触发说明内部不变量被破坏。
 - `Error::Multiple` 只用于聚合停止阶段的多个错误。
+- `Error::ContextShared` 表示 scope 存活期间尝试对父级 Context 执行可变操作。
 - 框架层错误不允许 `panic`。
 
 ---
@@ -529,7 +690,7 @@ pub enum Error {
 | 插件 apply 失败回滚 | 已实现 |
 | 停止失败继续清理 | 已实现 |
 | 重复 start / stop no-op | 已实现 |
-| Scope / 子 Context | 未实现 |
+| Scope / 子 Context | 已实现 |
 | EventBus | 未实现 |
 | 异步生命周期 | 未实现（后续另行定义） |
 

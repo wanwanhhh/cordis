@@ -13,7 +13,7 @@ mod error;
 mod plugin;
 mod service;
 
-pub use context::Context;
+pub use context::{Context, Scope};
 pub use error::Error;
 pub use plugin::{Dependency, Plugin};
 pub use service::ServiceRegistry;
@@ -38,7 +38,7 @@ mod tests {
                 let logger = ctx.require::<Logger>()?;
                 assert_eq!(logger.name, "main");
                 Ok(())
-            });
+            })?;
 
             Ok(())
         }
@@ -143,7 +143,7 @@ mod tests {
         impl Plugin for BadPlugin {
             fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
                 ctx.provide(42_u32)?;
-                ctx.on_ready(|_| Ok(()));
+                ctx.on_ready(|_| Ok(()))?;
                 Err(Error::PluginApply("boom".to_string()))
             }
         }
@@ -184,7 +184,8 @@ mod tests {
             let observed = ctx.require::<Arc<std::sync::Mutex<Vec<&'static str>>>>()?;
             observed.lock().unwrap().push("dispose");
             Ok(())
-        });
+        })
+        .unwrap();
         ctx.provide(observed.clone()).unwrap();
 
         ctx.plugin(OkPlugin(observed.clone())).unwrap();
@@ -229,12 +230,14 @@ mod tests {
         ctx.on_ready(move |_| {
             ready_counter.fetch_add(1, Ordering::SeqCst);
             Ok(())
-        });
+        })
+        .unwrap();
         let dispose_counter = dispose_count.clone();
         ctx.on_dispose(move |_| {
             dispose_counter.fetch_add(1, Ordering::SeqCst);
             Ok(())
-        });
+        })
+        .unwrap();
 
         ctx.start().unwrap();
         ctx.start().unwrap();
@@ -255,5 +258,108 @@ mod tests {
             err,
             Error::ServiceNotFound(name) if name.contains("u32")
         ));
+    }
+
+    #[test]
+    fn scope_plugin_can_access_parent_service() {
+        struct ParentService(&'static str);
+
+        struct ScopePlugin;
+
+        impl Plugin for ScopePlugin {
+            fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
+                let service = ctx.require::<ParentService>()?;
+                assert_eq!(service.0, "parent");
+                Ok(())
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.provide(ParentService("parent")).unwrap();
+
+        let mut scope = ctx.scope();
+        scope.plugin(ScopePlugin).unwrap();
+        scope.start().unwrap();
+        scope.stop().unwrap();
+    }
+
+    #[test]
+    fn scope_service_isolation_and_shadowing() {
+        struct ParentService;
+        struct ChildService;
+
+        let mut ctx = Context::new();
+        ctx.provide(ParentService).unwrap();
+
+        let mut scope = ctx.scope();
+        scope.provide(ChildService).unwrap();
+
+        // scope 可以看到父级服务，也可以看到自己的服务
+        assert!(scope.contains::<ParentService>());
+        assert!(scope.contains::<ChildService>());
+
+        // 父级看不到 scope 的局部服务
+        assert!(!ctx.contains::<ChildService>());
+        assert!(ctx.contains::<ParentService>());
+    }
+
+    #[test]
+    fn scope_dependency_check_sees_parent_service() {
+        struct ParentService;
+        struct NeedsParent;
+
+        impl Plugin for NeedsParent {
+            fn dependencies(&self) -> &'static [Dependency] {
+                static DEPS: std::sync::OnceLock<Dependency> = std::sync::OnceLock::new();
+                let dependency = DEPS.get_or_init(Dependency::of::<ParentService>);
+                std::slice::from_ref(dependency)
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.provide(ParentService).unwrap();
+
+        let mut scope = ctx.scope();
+        scope.plugin(NeedsParent).unwrap();
+
+        // 依赖检查应能看到父级服务
+        scope.verify_dependencies().unwrap();
+        scope.start().unwrap();
+        scope.stop().unwrap();
+    }
+
+    #[test]
+    fn scope_blocks_parent_mutation_until_dropped() {
+        struct ParentService;
+        struct ChildService;
+        struct DummyPlugin;
+
+        impl Plugin for DummyPlugin {}
+
+        let mut ctx = Context::new();
+        ctx.provide(ParentService).unwrap();
+
+        let mut scope = ctx.scope();
+        scope.provide(ChildService).unwrap();
+
+        // scope 存活期间父级不能添加服务、注册插件或停止。
+        assert!(matches!(
+            ctx.provide(ChildService),
+            Err(Error::ContextShared)
+        ));
+        assert!(matches!(ctx.plugin(DummyPlugin), Err(Error::ContextShared)));
+        assert!(matches!(ctx.stop(), Err(Error::ContextShared)));
+
+        // scope 销毁后，父级恢复可变能力。
+        drop(scope);
+        ctx.provide(ChildService).unwrap();
+        ctx.stop().unwrap();
+    }
+
+    #[test]
+    fn explicit_context_typing_does_not_break_scope() {
+        // 不依赖泛型生命周期推断，显式声明 Context 也能直接创建 scope。
+        let ctx: Context = Context::new();
+        let _scope = ctx.scope();
     }
 }
