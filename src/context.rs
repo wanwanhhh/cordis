@@ -1,6 +1,7 @@
 //! 核心上下文与 Scope。
 
 use std::any::TypeId;
+use std::future::Future;
 use std::mem;
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +31,33 @@ where
 {
     async fn call(&mut self, ctx: &mut Context) -> Result<(), Error> {
         (self.0)(ctx)
+    }
+}
+
+/// 异步闭包适配器，用于注册异步生命周期回调。
+///
+/// 回调接收一个克隆后的 `Context`，便于在异步任务中读取服务并向 runtime 共享。
+///
+/// 用法：
+///
+/// ```ignore
+/// ctx.on_ready(AsyncHook(|ctx: Context| async move {
+///     let service = ctx.require::<MyService>()?;
+///     service.init().await?;
+///     Ok(())
+/// }))?;
+/// ```
+pub struct AsyncHook<F>(pub F);
+
+#[async_trait]
+impl<F, Fut> LifecycleHook for AsyncHook<F>
+where
+    F: FnMut(Context) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), Error>> + Send + 'static,
+{
+    async fn call(&mut self, ctx: &mut Context) -> Result<(), Error> {
+        let ctx = ctx.clone();
+        (self.0)(ctx).await
     }
 }
 

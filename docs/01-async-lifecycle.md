@@ -125,6 +125,12 @@ ready_hooks: Mutex<Vec<ReadyHook>>,
 dispose_hooks: Mutex<Vec<DisposeHook>>,
 ```
 
+同时提供两个适配器：
+
+- `SyncHook`：包装同步 `FnMut(&mut Context) -> Result<(), Error>`
+- `AsyncHook`：包装异步 `FnMut(Context) -> Future<Output = Result<(), Error>>`，
+  回调接收克隆后的 `Context`，避免借用生命周期问题
+
 这样：
 
 - `LifecycleHook` 自身满足 `Send + Sync`
@@ -323,6 +329,20 @@ dispose hooks .await
 - 所有错误聚合为 `Error::Multiple`。
 
 ---
+
+### 9.3 取消语义
+
+- `start()` / `stop()` 的 future **不允许中途取消（drop）**。
+- 如果在插件 `start()` 的 await 点取消 future，`start_called` 可能已置位，导致后续无法重试。
+- 如果在 `stop()` 的 await 点取消 future，内部插件列表可能已被临时取出，造成状态丢失。
+- 当前阶段的契约是：**调用方必须让异步生命周期方法完整运行到最后**。
+- 如果未来需要支持取消，应重新设计状态机，将状态更新与 await 点分离。
+
+### 9.4 生命周期方法中的 Scope 使用规则
+
+- 插件在 `start()` / `stop()` 中创建 `Scope` 后，**不应长期持有**。
+- 如果异步任务长期持有某个 `Scope`，其祖先上下文会被 `Arc` 共享，后续 `start()` / `stop()` 会返回 `Error::ContextShared`。
+- 官方推荐用法：在生命周期方法中创建 Scope，仅用于局部工作，任务结束后显式 `stop()` 并 drop。
 
 ## 10. 多线程要求
 

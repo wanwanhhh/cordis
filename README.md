@@ -14,7 +14,7 @@ Rust 实现的 Cordis 风格插件化基础架构。
 - `Context` / `Scope`（支持 Clone、Arc、Send + Sync）
 - `Plugin`（异步 start / stop）
 - `ServiceRegistry`（Send + Sync 服务）
-- `LifecycleHook` / `SyncHook`
+- `LifecycleHook` / `SyncHook` / `AsyncHook`
 - 服务注册 / 获取
 - 父级服务继承与局部遮蔽
 - 插件依赖声明与检查

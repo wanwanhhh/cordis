@@ -42,7 +42,7 @@ mod error;
 mod plugin;
 mod service;
 
-pub use context::{Context, LifecycleHook, Scope, SyncHook};
+pub use context::{AsyncHook, Context, LifecycleHook, Scope, SyncHook};
 pub use error::Error;
 pub use plugin::{Dependency, Plugin};
 pub use service::ServiceRegistry;
@@ -51,8 +51,8 @@ pub use service::ServiceRegistry;
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         futures::executor::block_on(future)
@@ -115,7 +115,7 @@ mod tests {
 
         struct P(Arc<std::sync::Mutex<Vec<usize>>>, u8);
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for P {
             async fn start(&self, _ctx: &Context) -> Result<(), Error> {
                 self.0.lock().unwrap().push(self.1 as usize);
@@ -146,7 +146,7 @@ mod tests {
 
         struct NeedsMissing;
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for NeedsMissing {
             fn dependencies(&self) -> &'static [Dependency] {
                 static DEPENDENCY: std::sync::OnceLock<Dependency> = std::sync::OnceLock::new();
@@ -173,7 +173,7 @@ mod tests {
     fn plugin_apply_failure_rolls_back_partial_side_effects() {
         struct BadPlugin;
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for BadPlugin {
             fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
                 ctx.provide(42_u32)?;
@@ -193,7 +193,7 @@ mod tests {
 
         struct OkPlugin(Arc<std::sync::Mutex<Vec<&'static str>>>);
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for OkPlugin {
             async fn stop(&self, _ctx: &mut Context) -> Result<(), Error> {
                 self.0.lock().unwrap().push("ok_stop");
@@ -203,7 +203,7 @@ mod tests {
 
         struct BadPlugin(Arc<std::sync::Mutex<Vec<&'static str>>>);
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for BadPlugin {
             async fn stop(&self, _ctx: &mut Context) -> Result<(), Error> {
                 self.0.lock().unwrap().push("bad_stop");
@@ -238,7 +238,7 @@ mod tests {
 
         struct OncePlugin(Arc<AtomicUsize>, Arc<AtomicUsize>);
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for OncePlugin {
             async fn start(&self, _ctx: &Context) -> Result<(), Error> {
                 self.0.fetch_add(1, Ordering::SeqCst);
@@ -295,7 +295,7 @@ mod tests {
 
         struct ScopePlugin;
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for ScopePlugin {
             fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
                 let service = ctx.require::<ParentService>()?;
@@ -335,7 +335,7 @@ mod tests {
         struct ParentService;
         struct NeedsParent;
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for NeedsParent {
             fn dependencies(&self) -> &'static [Dependency] {
                 static DEPS: std::sync::OnceLock<Dependency> = std::sync::OnceLock::new();
@@ -361,7 +361,7 @@ mod tests {
         struct ChildService;
         struct DummyPlugin;
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for DummyPlugin {}
 
         let mut ctx = Context::new();
@@ -375,10 +375,7 @@ mod tests {
             Err(Error::ContextShared)
         ));
         assert!(matches!(ctx.plugin(DummyPlugin), Err(Error::ContextShared)));
-        assert!(matches!(
-            block_on(ctx.stop()),
-            Err(Error::ContextShared)
-        ));
+        assert!(matches!(block_on(ctx.stop()), Err(Error::ContextShared)));
 
         drop(scope);
         ctx.provide(ChildService).unwrap();
@@ -477,7 +474,7 @@ mod tests {
 
         struct FailingPlugin(Arc<std::sync::Mutex<Vec<&'static str>>>, Arc<AtomicUsize>);
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for FailingPlugin {
             async fn start(&self, _ctx: &Context) -> Result<(), Error> {
                 self.1.fetch_add(1, Ordering::SeqCst);
@@ -521,7 +518,7 @@ mod tests {
 
         struct Dummy;
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for Dummy {}
 
         let ctx = Context::new();
@@ -562,7 +559,7 @@ mod tests {
 
         struct Dummy;
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for Dummy {}
 
         let ctx = Context::new();
@@ -595,7 +592,7 @@ mod tests {
 
         struct Dummy;
 
-    #[async_trait]
+        #[async_trait]
         impl Plugin for Dummy {}
 
         let ctx = Context::new();
@@ -639,6 +636,61 @@ mod tests {
 
         drop(shared);
         ctx.provide(Service).unwrap();
+        block_on(ctx.stop()).unwrap();
+    }
+
+    #[test]
+    fn async_hook_registration_works() {
+        struct Dummy;
+
+        impl Plugin for Dummy {}
+
+        let ctx = Context::new();
+        let mut scope = ctx.scope();
+
+        scope
+            .on_ready(AsyncHook(|ctx: Context| async move {
+                let _ = ctx;
+                Ok(())
+            }))
+            .unwrap();
+
+        scope.plugin(Dummy).unwrap();
+
+        block_on(scope.start()).unwrap();
+        block_on(scope.stop()).unwrap();
+    }
+
+    #[test]
+    fn context_can_be_shared_across_threads() {
+        use std::thread;
+
+        struct Service(u32);
+
+        let mut ctx = Context::new();
+        ctx.provide(Service(42)).unwrap();
+        block_on(ctx.start()).unwrap();
+
+        let shared = ctx.clone();
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let ctx = shared.clone();
+                thread::spawn(move || {
+                    block_on(async move {
+                        let service = ctx.require::<Service>()?;
+                        assert_eq!(service.0, 42);
+                        Ok::<(), Error>(())
+                    })
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        drop(shared);
         block_on(ctx.stop()).unwrap();
     }
 }
