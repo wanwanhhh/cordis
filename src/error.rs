@@ -31,6 +31,9 @@ pub enum Error {
 
     /// 上下文已被 Scope 共享，当前不允许可变操作。
     ContextShared,
+
+    /// 事件订阅不存在或不属于当前上下文。
+    SubscriptionNotFound,
 }
 
 impl fmt::Display for Error {
@@ -60,6 +63,7 @@ impl fmt::Display for Error {
                 f,
                 "context is shared by a scope; mutable operations are not allowed"
             ),
+            Error::SubscriptionNotFound => write!(f, "event subscription not found"),
         }
     }
 }

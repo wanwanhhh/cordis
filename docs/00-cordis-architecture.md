@@ -719,7 +719,7 @@ pub enum Error {
 | 异步 start / stop | 已实现 |
 | `Plugin: Send + Sync` | 已实现 |
 | `Service: Send + Sync` | 已实现 |
-| EventBus | 未实现 |
+| EventBus | 已实现 |
 
 ---
 

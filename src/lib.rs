@@ -39,11 +39,13 @@
 
 mod context;
 mod error;
+mod event;
 mod plugin;
 mod service;
 
 pub use context::{AsyncHook, Context, LifecycleHook, Scope, SyncHook};
 pub use error::Error;
+pub use event::{Event, EventControl, EventHandler, FnEventHandler, Subscription};
 pub use plugin::{Dependency, Plugin};
 pub use service::ServiceRegistry;
 
@@ -692,5 +694,194 @@ mod tests {
 
         drop(shared);
         block_on(ctx.stop()).unwrap();
+    }
+
+    #[test]
+    fn event_serial_emit_runs_in_order() {
+        struct Ping(u32);
+
+        let mut ctx = Context::new();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let first = observed.clone();
+        ctx.on::<Ping, _>(FnEventHandler(move |event: &Ping, _: &Context| {
+            first.lock().unwrap().push(event.0);
+            Ok(EventControl::Continue)
+        }))
+        .unwrap();
+
+        let second = observed.clone();
+        ctx.on::<Ping, _>(FnEventHandler(move |event: &Ping, _: &Context| {
+            second.lock().unwrap().push(event.0 + 10);
+            Ok(EventControl::Continue)
+        }))
+        .unwrap();
+
+        block_on(ctx.emit(Ping(1))).unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(&*observed, &[1, 11]);
+    }
+
+    #[test]
+    fn event_scope_bubbles_to_parent() {
+        struct Ping;
+
+        let mut ctx = Context::new();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let root_handler = observed.clone();
+        ctx.on::<Ping, _>(FnEventHandler(move |_: &Ping, _: &Context| {
+            root_handler.lock().unwrap().push("root");
+            Ok(EventControl::Continue)
+        }))
+        .unwrap();
+
+        let mut scope = ctx.scope();
+        let child_handler = observed.clone();
+        scope
+            .on::<Ping, _>(FnEventHandler(move |_: &Ping, _: &Context| {
+                child_handler.lock().unwrap().push("child");
+                Ok(EventControl::Continue)
+            }))
+            .unwrap();
+
+        block_on(scope.emit(Ping)).unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(&*observed, &["child", "root"]);
+    }
+
+    #[test]
+    fn event_bail_stops_bubbling() {
+        struct Ping;
+
+        let mut ctx = Context::new();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let root_handler = observed.clone();
+        ctx.on::<Ping, _>(FnEventHandler(move |_: &Ping, _: &Context| {
+            root_handler.lock().unwrap().push("root");
+            Ok(EventControl::Continue)
+        }))
+        .unwrap();
+
+        let mut scope = ctx.scope();
+        let child_handler = observed.clone();
+        scope
+            .on::<Ping, _>(FnEventHandler(move |_: &Ping, _: &Context| {
+                child_handler.lock().unwrap().push("child");
+                Ok(EventControl::Bail)
+            }))
+            .unwrap();
+
+        block_on(scope.emit(Ping)).unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(&*observed, &["child"]);
+    }
+
+    #[test]
+    fn event_off_unsubscribes() {
+        struct Ping;
+
+        let mut ctx = Context::new();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let handler = observed.clone();
+        let subscription = ctx
+            .on::<Ping, _>(FnEventHandler(move |_: &Ping, _: &Context| {
+                handler.lock().unwrap().push("called");
+                Ok(EventControl::Continue)
+            }))
+            .unwrap();
+
+        block_on(ctx.emit(Ping)).unwrap();
+        ctx.off(subscription).unwrap();
+        block_on(ctx.emit(Ping)).unwrap();
+
+        assert_eq!(*observed.lock().unwrap(), vec!["called"]);
+    }
+
+    #[test]
+    fn event_parallel_runs_all_handlers() {
+        struct Ping;
+
+        let mut ctx = Context::new();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let handler = observed.clone();
+        ctx.on::<Ping, _>(FnEventHandler(move |_: &Ping, _: &Context| {
+            handler.lock().unwrap().push(1);
+            Ok(EventControl::Continue)
+        }))
+        .unwrap();
+
+        let handler = observed.clone();
+        ctx.on::<Ping, _>(FnEventHandler(move |_: &Ping, _: &Context| {
+            handler.lock().unwrap().push(2);
+            Ok(EventControl::Continue)
+        }))
+        .unwrap();
+
+        block_on(ctx.emit_parallel(Ping)).unwrap();
+
+        let mut observed = observed.lock().unwrap();
+        observed.sort_unstable();
+        assert_eq!(&*observed, &[1, 2]);
+    }
+
+    #[test]
+    fn event_on_and_off_blocked_after_clone() {
+        struct Ping;
+
+        let mut ctx = Context::new();
+        let _shared = ctx.clone();
+
+        assert!(matches!(
+            ctx.on::<Ping, _>(FnEventHandler(|_: &Ping, _: &Context| {
+                Ok(EventControl::Continue)
+            })),
+            Err(Error::ContextShared)
+        ));
+
+        assert!(matches!(
+            ctx.off(Subscription { context_id: 0, handler_id: 0 }),
+            Err(Error::ContextShared)
+        ));
+    }
+
+
+    #[test]
+    fn event_off_does_not_leak_across_contexts() {
+        struct Ping;
+
+        let mut ctx = Context::new();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let root_handler = observed.clone();
+        let root_sub = ctx
+            .on::<Ping, _>(FnEventHandler(move |_: &Ping, _: &Context| {
+                root_handler.lock().unwrap().push("root");
+                Ok(EventControl::Continue)
+            }))
+            .unwrap();
+
+        let mut child = ctx.scope();
+        let child_handler = observed.clone();
+        child
+            .on::<Ping, _>(FnEventHandler(move |_: &Ping, _: &Context| {
+                child_handler.lock().unwrap().push("child");
+                Ok(EventControl::Continue)
+            }))
+            .unwrap();
+
+        // 用 root 的订阅去 child 里取消，必须失败。
+        assert!(matches!(child.off(root_sub), Err(Error::SubscriptionNotFound)));
+
+        block_on(child.emit(Ping)).unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(&*observed, &["child", "root"]);
     }
 }

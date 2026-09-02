@@ -3,11 +3,15 @@
 use std::any::TypeId;
 use std::future::Future;
 use std::mem;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{Error, Plugin, ServiceRegistry};
+use crate::event::{ErasedEventHandler, Subscription, TypedEventHandler};
+use crate::{Error, Event, EventControl, EventHandler, Plugin, ServiceRegistry};
+
+static NEXT_CONTEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 type ReadyHook = Box<dyn LifecycleHook>;
 type DisposeHook = Box<dyn LifecycleHook>;
@@ -63,11 +67,14 @@ where
 
 /// 内部可共享状态。
 struct ContextInner {
+    context_id: usize,
     parent: Option<Arc<ContextInner>>,
     services: ServiceRegistry,
     plugins: Vec<Box<dyn Plugin>>,
     ready_hooks: Mutex<Vec<ReadyHook>>,
     dispose_hooks: Mutex<Vec<DisposeHook>>,
+    event_handlers: Mutex<Vec<Arc<dyn ErasedEventHandler>>>,
+    next_subscription_id: usize,
     start_called: bool,
     stopped: bool,
 }
@@ -75,11 +82,14 @@ struct ContextInner {
 impl ContextInner {
     fn new() -> Self {
         Self {
+            context_id: NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed),
             parent: None,
             services: ServiceRegistry::new(),
             plugins: Vec::new(),
             ready_hooks: Mutex::new(Vec::new()),
             dispose_hooks: Mutex::new(Vec::new()),
+            event_handlers: Mutex::new(Vec::new()),
+            next_subscription_id: 0,
             start_called: false,
             stopped: false,
         }
@@ -87,11 +97,14 @@ impl ContextInner {
 
     fn child(parent: &Arc<ContextInner>) -> Self {
         Self {
+            context_id: NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed),
             parent: Some(parent.clone()),
             services: ServiceRegistry::new(),
             plugins: Vec::new(),
             ready_hooks: Mutex::new(Vec::new()),
             dispose_hooks: Mutex::new(Vec::new()),
+            event_handlers: Mutex::new(Vec::new()),
+            next_subscription_id: 0,
             start_called: false,
             stopped: false,
         }
@@ -122,6 +135,16 @@ impl ContextInner {
             Some(parent) => parent.contains_type(type_id),
             None => false,
         }
+    }
+
+    fn event_handlers_for<E: Event>(&self) -> Vec<Arc<dyn ErasedEventHandler>> {
+        self.event_handlers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|handler| handler.event_type_id() == std::any::TypeId::of::<E>())
+            .cloned()
+            .collect()
     }
 
     fn verify_dependencies(&self) -> Result<(), Error> {
@@ -246,6 +269,99 @@ impl Context {
     /// 检查所有插件的依赖是否满足。
     pub fn verify_dependencies(&self) -> Result<(), Error> {
         self.inner.verify_dependencies()
+    }
+
+    /// 注册一个事件 handler。
+    pub fn on<E, H>(&mut self, handler: H) -> Result<Subscription, Error>
+    where
+        E: Event,
+        H: EventHandler<E>,
+    {
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+        let id = inner.next_subscription_id;
+        inner.next_subscription_id += 1;
+        inner
+            .event_handlers
+            .lock()
+            .unwrap()
+            .push(Arc::new(TypedEventHandler::new(id, handler)));
+        Ok(Subscription {
+            context_id: inner.context_id,
+            handler_id: id,
+        })
+    }
+
+    /// 取消一个事件订阅。
+    pub fn off(&mut self, subscription: Subscription) -> Result<(), Error> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+        if subscription.context_id != inner.context_id {
+            return Err(Error::SubscriptionNotFound);
+        }
+
+        let mut handlers = inner.event_handlers.lock().unwrap();
+        if let Some(index) = handlers
+            .iter()
+            .position(|handler| handler.id() == subscription.handler_id)
+        {
+            handlers.remove(index);
+            Ok(())
+        } else {
+            Err(Error::SubscriptionNotFound)
+        }
+    }
+
+    /// 串行发出事件，并沿 Scope 向上冒泡。
+    pub async fn emit<E: Event>(&self, event: E) -> Result<(), Error> {
+        self.emit_impl(event, false).await
+    }
+
+    /// 并发发出事件，并沿 Scope 向上冒泡。
+    pub async fn emit_parallel<E: Event>(&self, event: E) -> Result<(), Error> {
+        self.emit_impl(event, true).await
+    }
+
+    async fn emit_impl<E: Event>(&self, event: E, parallel: bool) -> Result<(), Error> {
+        let mut current = Some(self.inner.clone());
+
+        while let Some(inner) = current {
+            let handlers = inner.event_handlers_for::<E>();
+
+            if parallel {
+                let results = futures::future::join_all(
+                    handlers.iter().map(|handler| handler.call(&event, &*self)),
+                )
+                .await;
+
+                let mut errors = Vec::new();
+                let mut bail = false;
+                for result in results {
+                    match result {
+                        Ok(EventControl::Continue) => {}
+                        Ok(EventControl::Bail) => bail = true,
+                        Err(err) => errors.push(err),
+                    }
+                }
+
+                if !errors.is_empty() {
+                    return Err(Error::Multiple(errors));
+                }
+                if bail {
+                    return Ok(());
+                }
+            } else {
+                for handler in &handlers {
+                    match handler.call(&event, self).await {
+                        Ok(EventControl::Continue) => {}
+                        Ok(EventControl::Bail) => return Ok(()),
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+
+            current = inner.parent.clone();
+        }
+
+        Ok(())
     }
 
     /// 异步启动上下文。
@@ -387,6 +503,30 @@ impl Scope {
     /// 注册 dispose 回调。
     pub fn on_dispose(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
         self.ctx.on_dispose(hook)
+    }
+
+    /// 注册事件 handler。
+    pub fn on<E, H>(&mut self, handler: H) -> Result<Subscription, Error>
+    where
+        E: Event,
+        H: EventHandler<E>,
+    {
+        self.ctx.on(handler)
+    }
+
+    /// 取消事件订阅。
+    pub fn off(&mut self, subscription: Subscription) -> Result<(), Error> {
+        self.ctx.off(subscription)
+    }
+
+    /// 串行发出事件。
+    pub async fn emit<E: Event>(&self, event: E) -> Result<(), Error> {
+        self.ctx.emit(event).await
+    }
+
+    /// 并发发出事件。
+    pub async fn emit_parallel<E: Event>(&self, event: E) -> Result<(), Error> {
+        self.ctx.emit_parallel(event).await
     }
 
     /// 异步启动 scope。

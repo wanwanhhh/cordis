@@ -8,6 +8,7 @@ Rust 实现的 Cordis 风格插件化基础架构。
 
 - [Cordis 底层约束与开发指导](docs/00-cordis-architecture.md)
 - [异步生命周期与线程安全设计](docs/01-async-lifecycle.md)
+- [EventBus / 事件系统设计](docs/02-event-bus.md)
 
 ## 当前实现
 
@@ -24,6 +25,7 @@ Rust 实现的 Cordis 风格插件化基础架构。
 - 停止失败继续清理
 - 重复 start / stop 安全 no-op
 - 嵌套 Scope
+- 事件系统（类型化、Scope 冒泡、serial / parallel）
 - 逆序销毁
 
 ## 运行示例
@@ -32,6 +34,7 @@ Rust 实现的 Cordis 风格插件化基础架构。
 cargo run --example basic
 cargo run --example full
 cargo run --example scopes
+cargo run --example events
 ```
 
 ## 测试
