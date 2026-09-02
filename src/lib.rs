@@ -45,8 +45,10 @@ mod service;
 
 pub use context::{AsyncHook, Context, LifecycleHook, Scope, SyncHook};
 pub use error::Error;
-pub use event::{Event, EventControl, EventHandler, FnEventHandler, Subscription};
-pub use plugin::{Dependency, Plugin};
+pub use event::{
+    AsyncFnEventHandler, Event, EventControl, EventHandler, FnEventHandler, Subscription,
+};
+pub use plugin::{Dependency, Plugin, PluginDependency};
 pub use service::ServiceRegistry;
 
 #[cfg(test)]
@@ -119,6 +121,10 @@ mod tests {
 
         #[async_trait]
         impl Plugin for P {
+            fn name(&self) -> &'static str {
+                if self.1 == 1 { "p1" } else { "p2" }
+            }
+
             async fn start(&self, _ctx: &Context) -> Result<(), Error> {
                 self.0.lock().unwrap().push(self.1 as usize);
                 Ok(())
@@ -846,11 +852,13 @@ mod tests {
         ));
 
         assert!(matches!(
-            ctx.off(Subscription { context_id: 0, handler_id: 0 }),
+            ctx.off(Subscription {
+                context_id: 0,
+                handler_id: 0
+            }),
             Err(Error::ContextShared)
         ));
     }
-
 
     #[test]
     fn event_off_does_not_leak_across_contexts() {
@@ -877,11 +885,430 @@ mod tests {
             .unwrap();
 
         // 用 root 的订阅去 child 里取消，必须失败。
-        assert!(matches!(child.off(root_sub), Err(Error::SubscriptionNotFound)));
+        assert!(matches!(
+            child.off(root_sub),
+            Err(Error::SubscriptionNotFound)
+        ));
 
         block_on(child.emit(Ping)).unwrap();
 
         let observed = observed.lock().unwrap();
         assert_eq!(&*observed, &["child", "root"]);
+    }
+
+    #[test]
+    fn try_require_handles_missing_and_present() {
+        #[derive(Debug)]
+        struct Present;
+        struct Missing;
+
+        let mut ctx = Context::new();
+        assert!(ctx.try_require::<Missing>().unwrap().is_none());
+
+        ctx.provide(Present).unwrap();
+        assert!(ctx.try_require::<Present>().unwrap().is_some());
+    }
+
+    #[test]
+    fn collection_is_local_only() {
+        struct Tool(&'static str);
+
+        let mut ctx = Context::new();
+        ctx.provide_collect(Tool("root")).unwrap();
+
+        let mut scope = ctx.scope();
+        scope.provide_collect(Tool("child")).unwrap();
+
+        let root_all = ctx.require_all::<Tool>().unwrap();
+        assert_eq!(root_all.len(), 1);
+        assert_eq!(root_all[0].0, "root");
+
+        let child_all = scope.require_all::<Tool>().unwrap();
+        assert_eq!(child_all.len(), 1);
+        assert_eq!(child_all[0].0, "child");
+    }
+
+    #[test]
+    fn factory_is_lazy_and_retries_on_error() {
+        struct Lazy(String);
+
+        let mut ctx = Context::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let inside = calls.clone();
+        ctx.provide_factory(move || -> Result<Lazy, Error> {
+            inside.fetch_add(1, Ordering::SeqCst);
+            Err(Error::PluginStart("boom".to_string()))
+        })
+        .unwrap();
+
+        assert!(ctx.require::<Lazy>().is_err());
+        assert!(ctx.require::<Lazy>().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let mut ctx = Context::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let inside = calls.clone();
+        ctx.provide_factory(move || -> Result<Lazy, Error> {
+            inside.fetch_add(1, Ordering::SeqCst);
+            Ok(Lazy("ok".to_string()))
+        })
+        .unwrap();
+
+        assert_eq!(ctx.require::<Lazy>().unwrap().0, "ok");
+        assert_eq!(ctx.require::<Lazy>().unwrap().0, "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn factory_works_with_require_mut_and_contains() {
+        let mut ctx = Context::new();
+        ctx.provide_factory(|| Ok::<u32, Error>(0)).unwrap();
+
+        assert!(ctx.contains::<u32>());
+        *ctx.require_mut::<u32>().unwrap() += 1;
+        assert_eq!(*ctx.require::<u32>().unwrap(), 1);
+    }
+
+    #[test]
+    fn async_fn_event_handler_works() {
+        struct Ping;
+
+        let mut ctx = Context::new();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let handler = observed.clone();
+        ctx.on::<Ping, _>(AsyncFnEventHandler(move |_: &Ping, _ctx: Context| {
+            let handler = handler.clone();
+            async move {
+                handler.lock().unwrap().push(1);
+                Ok(EventControl::Continue)
+            }
+        }))
+        .unwrap();
+
+        block_on(ctx.emit(Ping)).unwrap();
+        assert_eq!(*observed.lock().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn optional_dependency_missing_does_not_block_start() {
+        struct Missing;
+
+        struct OptionalPlugin;
+
+        impl Plugin for OptionalPlugin {
+            fn dependencies(&self) -> &'static [Dependency] {
+                static DEPS: std::sync::OnceLock<[Dependency; 1]> = std::sync::OnceLock::new();
+                let deps = DEPS.get_or_init(|| [Dependency::optional_of::<Missing>()]);
+                &deps[..]
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.plugin(OptionalPlugin).unwrap();
+        block_on(ctx.start()).unwrap();
+        block_on(ctx.stop()).unwrap();
+    }
+
+    #[test]
+    fn priority_controls_start_and_stop_order() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        struct P(Arc<std::sync::Mutex<Vec<usize>>>, i32, usize);
+
+        #[async_trait]
+        impl Plugin for P {
+            fn name(&self) -> &'static str {
+                if self.2 == 1 { "p1" } else { "p2" }
+            }
+
+            fn priority(&self) -> i32 {
+                self.1
+            }
+
+            async fn start(&self, _ctx: &Context) -> Result<(), Error> {
+                self.0.lock().unwrap().push(self.2);
+                Ok(())
+            }
+
+            async fn stop(&self, _ctx: &mut Context) -> Result<(), Error> {
+                self.0.lock().unwrap().push(10 + self.2);
+                Ok(())
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.plugin(P(observed.clone(), 0, 1)).unwrap();
+        ctx.plugin(P(observed.clone(), 10, 2)).unwrap();
+
+        block_on(ctx.start()).unwrap();
+        block_on(ctx.stop()).unwrap();
+
+        let observed = observed.lock().unwrap();
+        // start: high priority 2 first, then 1; stop reverse: 1 then 2
+        assert_eq!(&*observed, &[2, 1, 11, 12]);
+    }
+
+    #[test]
+    fn service_and_factory_cannot_coexist() {
+        let mut ctx = Context::new();
+        ctx.provide_factory(|| Ok::<u32, Error>(1)).unwrap();
+        assert!(matches!(
+            ctx.provide(2_u32),
+            Err(Error::ServiceAlreadyRegistered(_))
+        ));
+    }
+
+    #[test]
+    fn plugin_dependency_missing_blocks_start() {
+        struct NeedsMissing;
+
+        impl Plugin for NeedsMissing {
+            fn plugin_dependencies(&self) -> &'static [PluginDependency] {
+                static DEPS: std::sync::OnceLock<[PluginDependency; 1]> =
+                    std::sync::OnceLock::new();
+                let deps = DEPS.get_or_init(|| [PluginDependency::of("missing")]);
+                &deps[..]
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.plugin(NeedsMissing).unwrap();
+        assert!(matches!(
+            block_on(ctx.start()),
+            Err(Error::PluginDependencyNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn optional_plugin_dependency_missing_does_not_block() {
+        struct OptionalPlugin;
+
+        impl Plugin for OptionalPlugin {
+            fn plugin_dependencies(&self) -> &'static [PluginDependency] {
+                static DEPS: std::sync::OnceLock<[PluginDependency; 1]> =
+                    std::sync::OnceLock::new();
+                let deps = DEPS.get_or_init(|| [PluginDependency::optional_of("missing")]);
+                &deps[..]
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.plugin(OptionalPlugin).unwrap();
+        block_on(ctx.start()).unwrap();
+        block_on(ctx.stop()).unwrap();
+    }
+
+    #[test]
+    fn plugin_dependency_topological_order() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        struct A(Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+        #[async_trait]
+        impl Plugin for A {
+            fn name(&self) -> &'static str {
+                "a"
+            }
+
+            fn plugin_dependencies(&self) -> &'static [PluginDependency] {
+                static DEPS: std::sync::OnceLock<[PluginDependency; 1]> =
+                    std::sync::OnceLock::new();
+                let deps = DEPS.get_or_init(|| [PluginDependency::of("b")]);
+                &deps[..]
+            }
+
+            async fn start(&self, _ctx: &Context) -> Result<(), Error> {
+                self.0.lock().unwrap().push("a-start");
+                Ok(())
+            }
+
+            async fn stop(&self, _ctx: &mut Context) -> Result<(), Error> {
+                self.0.lock().unwrap().push("a-stop");
+                Ok(())
+            }
+        }
+
+        struct B(Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+        #[async_trait]
+        impl Plugin for B {
+            fn name(&self) -> &'static str {
+                "b"
+            }
+
+            async fn start(&self, _ctx: &Context) -> Result<(), Error> {
+                self.0.lock().unwrap().push("b-start");
+                Ok(())
+            }
+
+            async fn stop(&self, _ctx: &mut Context) -> Result<(), Error> {
+                self.0.lock().unwrap().push("b-stop");
+                Ok(())
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.plugin(A(observed.clone())).unwrap();
+        ctx.plugin(B(observed.clone())).unwrap();
+
+        block_on(ctx.start()).unwrap();
+        block_on(ctx.stop()).unwrap();
+
+        let observed = observed.lock().unwrap();
+        // b 必须先于 a 启动；停车时逆序：a 先停，b 后停
+        assert_eq!(&*observed, &["b-start", "a-start", "a-stop", "b-stop"]);
+    }
+
+    #[test]
+    fn plugin_dependency_cycle_detected() {
+        struct A;
+        struct B;
+
+        impl Plugin for A {
+            fn name(&self) -> &'static str {
+                "a"
+            }
+
+            fn plugin_dependencies(&self) -> &'static [PluginDependency] {
+                static DEPS: std::sync::OnceLock<[PluginDependency; 1]> =
+                    std::sync::OnceLock::new();
+                let deps = DEPS.get_or_init(|| [PluginDependency::of("b")]);
+                &deps[..]
+            }
+        }
+
+        impl Plugin for B {
+            fn name(&self) -> &'static str {
+                "b"
+            }
+
+            fn plugin_dependencies(&self) -> &'static [PluginDependency] {
+                static DEPS: std::sync::OnceLock<[PluginDependency; 1]> =
+                    std::sync::OnceLock::new();
+                let deps = DEPS.get_or_init(|| [PluginDependency::of("a")]);
+                &deps[..]
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.plugin(A).unwrap();
+        ctx.plugin(B).unwrap();
+        assert!(matches!(
+            block_on(ctx.start()),
+            Err(Error::PluginDependencyCycle)
+        ));
+    }
+
+    #[test]
+    fn plugin_name_uniqueness_enforced() {
+        struct First;
+        struct Second;
+
+        impl Plugin for First {
+            fn name(&self) -> &'static str {
+                "duplicate"
+            }
+        }
+
+        impl Plugin for Second {
+            fn name(&self) -> &'static str {
+                "duplicate"
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.plugin(First).unwrap();
+        assert!(matches!(
+            ctx.plugin(Second),
+            Err(Error::PluginNameAlreadyRegistered(_))
+        ));
+    }
+
+    #[test]
+    fn has_plugin_sees_parent() {
+        struct RootPlugin;
+
+        impl Plugin for RootPlugin {
+            fn name(&self) -> &'static str {
+                "root-plugin"
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.plugin(RootPlugin).unwrap();
+
+        let scope = ctx.scope();
+        assert!(scope.has_plugin("root-plugin"));
+        assert!(!scope.has_plugin("missing"));
+    }
+
+    #[test]
+    fn plugin_with_config_injects_and_rolls_back() {
+        #[derive(Clone)]
+        struct MyConfig;
+
+        struct ConfigPlugin;
+
+        impl Plugin for ConfigPlugin {
+            fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
+                let _ = ctx.require::<MyConfig>()?;
+                Ok(())
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.plugin_with_config(ConfigPlugin, MyConfig).unwrap();
+        assert!(ctx.contains::<MyConfig>());
+
+        struct BadPlugin;
+
+        impl Plugin for BadPlugin {
+            fn apply(&self, _ctx: &mut Context) -> Result<(), Error> {
+                Err(Error::PluginApply("boom".to_string()))
+            }
+        }
+
+        let mut ctx = Context::new();
+        assert!(ctx.plugin_with_config(BadPlugin, MyConfig).is_err());
+        assert!(!ctx.contains::<MyConfig>());
+    }
+
+
+    #[test]
+    fn child_plugin_can_depend_on_parent_plugin() {
+        struct RootPlugin;
+
+        impl Plugin for RootPlugin {
+            fn name(&self) -> &'static str {
+                "root"
+            }
+        }
+
+        struct ChildPlugin;
+
+        impl Plugin for ChildPlugin {
+            fn name(&self) -> &'static str {
+                "child"
+            }
+
+            fn plugin_dependencies(&self) -> &'static [PluginDependency] {
+                static DEPS: std::sync::OnceLock<[PluginDependency; 1]> = std::sync::OnceLock::new();
+                let deps = DEPS.get_or_init(|| [PluginDependency::of("root")]);
+                &deps[..]
+            }
+        }
+
+        let mut ctx = Context::new();
+        ctx.plugin(RootPlugin).unwrap();
+        block_on(ctx.start()).unwrap();
+
+        let mut scope = ctx.scope();
+        scope.plugin(ChildPlugin).unwrap();
+        block_on(scope.start()).unwrap();
+        block_on(scope.stop()).unwrap();
+
+        drop(scope);
+        block_on(ctx.stop()).unwrap();
     }
 }

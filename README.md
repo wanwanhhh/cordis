@@ -9,6 +9,8 @@ Rust 实现的 Cordis 风格插件化基础架构。
 - [Cordis 底层约束与开发指导](docs/00-cordis-architecture.md)
 - [异步生命周期与线程安全设计](docs/01-async-lifecycle.md)
 - [EventBus / 事件系统设计](docs/02-event-bus.md)
+- [v0.3 服务与插件增强设计](docs/03-service-plugin-enhancements.md)
+- [插件系统增强设计](docs/04-plugin-system-enhancements.md)
 
 ## 当前实现
 
@@ -16,9 +18,17 @@ Rust 实现的 Cordis 风格插件化基础架构。
 - `Plugin`（异步 start / stop）
 - `ServiceRegistry`（Send + Sync 服务）
 - `LifecycleHook` / `SyncHook` / `AsyncHook`
+- `FnEventHandler` / `AsyncFnEventHandler`
 - 服务注册 / 获取
+- `try_require` / `require_all`
+- `Collection<T>` 多实现服务
+- `provide_factory` 懒加载服务
 - 父级服务继承与局部遮蔽
 - 插件依赖声明与检查
+- 可选依赖
+- 插件间依赖 `PluginDependency`
+- 插件配置注入 `plugin_with_config`
+- 插件元信息 / 优先级
 - `apply` 失败回滚
 - 异步 ready / dispose 生命周期
 - 启动失败 fail-fast

@@ -34,6 +34,15 @@ pub enum Error {
 
     /// 事件订阅不存在或不属于当前上下文。
     SubscriptionNotFound,
+
+    /// 插件名重复注册。
+    PluginNameAlreadyRegistered(String),
+
+    /// 插件依赖缺失。
+    PluginDependencyNotFound(String),
+
+    /// 插件依赖存在循环。
+    PluginDependencyCycle,
 }
 
 impl fmt::Display for Error {
@@ -64,6 +73,13 @@ impl fmt::Display for Error {
                 "context is shared by a scope; mutable operations are not allowed"
             ),
             Error::SubscriptionNotFound => write!(f, "event subscription not found"),
+            Error::PluginNameAlreadyRegistered(name) => {
+                write!(f, "plugin name already registered: {name}")
+            }
+            Error::PluginDependencyNotFound(name) => {
+                write!(f, "plugin dependency not found: {name}")
+            }
+            Error::PluginDependencyCycle => write!(f, "plugin dependency cycle detected"),
         }
     }
 }

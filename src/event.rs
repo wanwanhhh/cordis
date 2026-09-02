@@ -1,6 +1,7 @@
 //! 类型化事件系统。
 
 use std::any::{Any, TypeId};
+use std::future::Future;
 use std::marker::PhantomData;
 
 use async_trait::async_trait;
@@ -40,6 +41,22 @@ where
 {
     async fn handle(&self, event: &E, ctx: &Context) -> Result<EventControl, Error> {
         (self.0)(event, ctx)
+    }
+}
+
+/// 异步闭包事件 handler 适配器。
+pub struct AsyncFnEventHandler<F>(pub F);
+
+#[async_trait]
+impl<E, F, Fut> EventHandler<E> for AsyncFnEventHandler<F>
+where
+    E: Event,
+    F: Fn(&E, Context) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<EventControl, Error>> + Send + 'static,
+{
+    async fn handle(&self, event: &E, ctx: &Context) -> Result<EventControl, Error> {
+        let ctx = ctx.clone();
+        (self.0)(event, ctx).await
     }
 }
 

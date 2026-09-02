@@ -71,10 +71,12 @@ struct ContextInner {
     parent: Option<Arc<ContextInner>>,
     services: ServiceRegistry,
     plugins: Vec<Box<dyn Plugin>>,
+    plugin_names: Vec<&'static str>,
     ready_hooks: Mutex<Vec<ReadyHook>>,
     dispose_hooks: Mutex<Vec<DisposeHook>>,
     event_handlers: Mutex<Vec<Arc<dyn ErasedEventHandler>>>,
     next_subscription_id: usize,
+    start_order: Vec<usize>,
     start_called: bool,
     stopped: bool,
 }
@@ -86,10 +88,12 @@ impl ContextInner {
             parent: None,
             services: ServiceRegistry::new(),
             plugins: Vec::new(),
+            plugin_names: Vec::new(),
             ready_hooks: Mutex::new(Vec::new()),
             dispose_hooks: Mutex::new(Vec::new()),
             event_handlers: Mutex::new(Vec::new()),
             next_subscription_id: 0,
+            start_order: Vec::new(),
             start_called: false,
             stopped: false,
         }
@@ -101,16 +105,18 @@ impl ContextInner {
             parent: Some(parent.clone()),
             services: ServiceRegistry::new(),
             plugins: Vec::new(),
+            plugin_names: Vec::new(),
             ready_hooks: Mutex::new(Vec::new()),
             dispose_hooks: Mutex::new(Vec::new()),
             event_handlers: Mutex::new(Vec::new()),
             next_subscription_id: 0,
+            start_order: Vec::new(),
             start_called: false,
             stopped: false,
         }
     }
 
-    fn require<T: 'static>(&self) -> Result<&T, Error> {
+    fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
         match self.services.get::<T>() {
             Ok(value) => Ok(value),
             Err(Error::ServiceNotFound(_)) => match &self.parent {
@@ -123,7 +129,21 @@ impl ContextInner {
         }
     }
 
-    fn contains<T: 'static>(&self) -> bool {
+    fn try_require<T: Send + Sync + 'static>(&self) -> Result<Option<&T>, Error> {
+        match self.services.try_get::<T>()? {
+            Some(value) => Ok(Some(value)),
+            None => match &self.parent {
+                Some(parent) => parent.try_require::<T>(),
+                None => Ok(None),
+            },
+        }
+    }
+
+    fn all<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
+        self.services.all()
+    }
+
+    fn contains<T: Send + Sync + 'static>(&self) -> bool {
         self.services.contains::<T>() || self.contains_type(TypeId::of::<T>())
     }
 
@@ -147,11 +167,95 @@ impl ContextInner {
             .collect()
     }
 
+    fn has_plugin(&self, name: &str) -> bool {
+        if self.plugin_names.contains(&name) {
+            return true;
+        }
+        match &self.parent {
+            Some(parent) => parent.has_plugin(name),
+            None => false,
+        }
+    }
+
+    fn compute_start_order(&self) -> Result<Vec<usize>, Error> {
+        let n = self.plugins.len();
+        let mut indegree = vec![0usize; n];
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+        for (i, plugin) in self.plugins.iter().enumerate() {
+            for plugin_dependency in plugin.plugin_dependencies() {
+                match self
+                    .plugin_names
+                    .iter()
+                    .position(|name| *name == plugin_dependency.plugin_name)
+                {
+                    Some(j) => {
+                        dependents[j].push(i);
+                        indegree[i] += 1;
+                    }
+                    None => {
+                        // 目标插件可能位于父级 Scope：依赖检查已通过时不需要本地排序边。
+                        if !plugin_dependency.optional
+                            && !self.has_plugin(plugin_dependency.plugin_name)
+                        {
+                            return Err(Error::PluginDependencyNotFound(
+                                plugin_dependency.plugin_name.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut order = Vec::with_capacity(n);
+        let mut remaining: Vec<usize> = (0..n).collect();
+
+        while !remaining.is_empty() {
+            let candidates: Vec<usize> = remaining
+                .iter()
+                .copied()
+                .filter(|&index| indegree[index] == 0)
+                .collect();
+
+            if candidates.is_empty() {
+                return Err(Error::PluginDependencyCycle);
+            }
+
+            let next = *candidates
+                .iter()
+                .max_by(|&&a, &&b| {
+                    self.plugins[a]
+                        .priority()
+                        .cmp(&self.plugins[b].priority())
+                        .then(b.cmp(&a))
+                })
+                .expect("candidates is not empty");
+
+            order.push(next);
+
+            for &dependent in &dependents[next] {
+                indegree[dependent] -= 1;
+            }
+
+            remaining.retain(|&index| index != next);
+        }
+
+        Ok(order)
+    }
+
     fn verify_dependencies(&self) -> Result<(), Error> {
         for plugin in &self.plugins {
             for dependency in plugin.dependencies() {
-                if !self.contains_type(dependency.type_id) {
+                if !dependency.optional && !self.contains_type(dependency.type_id) {
                     return Err(Error::ServiceNotFound(dependency.name.to_string()));
+                }
+            }
+
+            for plugin_dependency in plugin.plugin_dependencies() {
+                if !plugin_dependency.optional && !self.has_plugin(plugin_dependency.plugin_name) {
+                    return Err(Error::PluginDependencyNotFound(
+                        plugin_dependency.plugin_name.to_string(),
+                    ));
                 }
             }
         }
@@ -190,22 +294,29 @@ impl Context {
     ///
     /// 如果 `apply` 失败，该插件本次产生的副作用会被回滚。
     pub fn plugin<P: Plugin>(&mut self, plugin: P) -> Result<(), Error> {
+        let name = plugin.name();
+
         let snapshot = {
             let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+            if inner.plugin_names.contains(&name) {
+                return Err(Error::PluginNameAlreadyRegistered(name.to_string()));
+            }
             (
                 inner.services.type_ids(),
                 inner.plugins.len(),
+                inner.plugin_names.len(),
                 inner.ready_hooks.lock().unwrap().len(),
                 inner.dispose_hooks.lock().unwrap().len(),
             )
         };
 
-        let (service_keys, plugin_len, ready_len, dispose_len) = snapshot;
+        let (service_keys, plugin_len, plugin_names_len, ready_len, dispose_len) = snapshot;
 
         if let Err(err) = plugin.apply(self) {
             let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
             inner.services.retain(&service_keys);
             inner.plugins.truncate(plugin_len);
+            inner.plugin_names.truncate(plugin_names_len);
             inner.ready_hooks.lock().unwrap().truncate(ready_len);
             inner.dispose_hooks.lock().unwrap().truncate(dispose_len);
             return Err(Error::PluginApply(err.to_string()));
@@ -213,6 +324,7 @@ impl Context {
 
         let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
         inner.plugins.push(Box::new(plugin));
+        inner.plugin_names.push(name);
         Ok(())
     }
 
@@ -228,28 +340,83 @@ impl Context {
         Ok(())
     }
 
+    /// 注册插件并注入配置。
+    ///
+    /// 配置会以 `C` 类型作为当前 Context 的服务注入；插件可通过 `require::<C>()` 读取。
+    /// 如果插件 `apply` 失败，配置服务也会一起回滚。
+    pub fn plugin_with_config<P, C>(&mut self, plugin: P, config: C) -> Result<(), Error>
+    where
+        P: Plugin,
+        C: Send + Sync + 'static,
+    {
+        let snapshot = {
+            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+            inner.services.type_ids()
+        };
+
+        self.provide(config)?;
+
+        if let Err(err) = self.plugin(plugin) {
+            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+            inner.services.retain(&snapshot);
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
     /// 注册服务。
     pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
         let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
         inner.services.provide(value)
     }
 
+    /// 注册一个懒加载服务工厂。
+    pub fn provide_factory<T: Send + Sync + 'static>(
+        &mut self,
+        factory: impl Fn() -> Result<T, Error> + Send + Sync + 'static,
+    ) -> Result<(), Error> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+        inner.services.provide_factory(factory)
+    }
+
+    /// 注册一个集合服务实现。
+    pub fn provide_collect<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+        inner.services.provide_collect(value)
+    }
+
+    /// 尝试获取服务（普通服务或工厂，含父级）。
+    pub fn try_require<T: Send + Sync + 'static>(&self) -> Result<Option<&T>, Error> {
+        self.inner.try_require()
+    }
+
+    /// 获取当前 Context 局部集合中的所有实现。
+    pub fn require_all<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
+        self.inner.all()
+    }
+
     /// 获取服务引用。
     ///
     /// 查找顺序：当前上下文局部服务 -> 父级上下文服务（递归）。
-    pub fn require<T: 'static>(&self) -> Result<&T, Error> {
+    pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
         self.inner.require()
     }
 
     /// 获取本地服务可变引用。
-    pub fn require_mut<T: 'static>(&mut self) -> Result<&mut T, Error> {
+    pub fn require_mut<T: Send + Sync + 'static>(&mut self) -> Result<&mut T, Error> {
         let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
         inner.services.get_mut()
     }
 
     /// 判断服务是否存在（局部 + 父级）。
-    pub fn contains<T: 'static>(&self) -> bool {
+    pub fn contains<T: Send + Sync + 'static>(&self) -> bool {
         self.inner.contains::<T>()
+    }
+
+    /// 判断某个插件是否已注册（局部 + 父级）。
+    pub fn has_plugin(&self, name: &str) -> bool {
+        self.inner.has_plugin(name)
     }
 
     /// 注册一个 ready 回调。
@@ -368,17 +535,20 @@ impl Context {
     ///
     /// 只启动当前上下文内注册的插件，不影响父级。
     pub async fn start(&mut self) -> Result<(), Error> {
-        {
+        let order = {
             let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
             if inner.start_called {
                 return Ok(());
             }
             inner.verify_dependencies()?;
+            let order = inner.compute_start_order()?;
+            inner.start_order = order.clone();
             inner.start_called = true;
-        }
+            order
+        };
 
-        for plugin in &self.inner.plugins {
-            plugin.start(&*self).await?;
+        for index in order {
+            self.inner.plugins[index].start(&*self).await?;
         }
 
         let mut hooks = {
@@ -398,17 +568,24 @@ impl Context {
     pub async fn stop(&mut self) -> Result<(), Error> {
         let mut errors = Vec::new();
 
-        let plugins = {
+        let (plugins, order) = {
             let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
             if inner.stopped {
                 return Ok(());
             }
             inner.stopped = true;
-            mem::take(&mut inner.plugins)
+            let order = if inner.start_order.is_empty() {
+                (0..inner.plugins.len()).collect::<Vec<_>>()
+            } else {
+                inner.start_order.clone()
+            };
+            (mem::take(&mut inner.plugins), order)
         };
 
-        for plugin in plugins.iter().rev() {
-            if let Err(err) = plugin.stop(self).await {
+        for &index in order.iter().rev() {
+            if let Some(plugin) = plugins.get(index)
+                && let Err(err) = plugin.stop(self).await
+            {
                 errors.push(err);
             }
         }
@@ -470,24 +647,61 @@ impl Scope {
         self.ctx.plugins(plugins)
     }
 
+    /// 注册插件并注入配置。
+    pub fn plugin_with_config<P, C>(&mut self, plugin: P, config: C) -> Result<(), Error>
+    where
+        P: Plugin,
+        C: Send + Sync + 'static,
+    {
+        self.ctx.plugin_with_config(plugin, config)
+    }
+
     /// 注册局部服务。
     pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
         self.ctx.provide(value)
     }
 
+    /// 注册懒加载服务工厂。
+    pub fn provide_factory<T: Send + Sync + 'static>(
+        &mut self,
+        factory: impl Fn() -> Result<T, Error> + Send + Sync + 'static,
+    ) -> Result<(), Error> {
+        self.ctx.provide_factory(factory)
+    }
+
+    /// 注册集合服务实现。
+    pub fn provide_collect<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
+        self.ctx.provide_collect(value)
+    }
+
+    /// 尝试获取服务（含父级）。
+    pub fn try_require<T: Send + Sync + 'static>(&self) -> Result<Option<&T>, Error> {
+        self.ctx.try_require()
+    }
+
+    /// 获取 Scope 局部集合中的所有实现。
+    pub fn require_all<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
+        self.ctx.require_all()
+    }
+
     /// 查询服务：局部优先，父级兜底。
-    pub fn require<T: 'static>(&self) -> Result<&T, Error> {
+    pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
         self.ctx.require()
     }
 
     /// 获取本地服务可变引用。
-    pub fn require_mut<T: 'static>(&mut self) -> Result<&mut T, Error> {
+    pub fn require_mut<T: Send + Sync + 'static>(&mut self) -> Result<&mut T, Error> {
         self.ctx.require_mut()
     }
 
     /// 判断服务是否存在（局部 + 父级）。
-    pub fn contains<T: 'static>(&self) -> bool {
+    pub fn contains<T: Send + Sync + 'static>(&self) -> bool {
         self.ctx.contains::<T>()
+    }
+
+    /// 判断某个插件是否已注册（局部 + 父级）。
+    pub fn has_plugin(&self, name: &str) -> bool {
+        self.ctx.has_plugin(name)
     }
 
     /// 检查依赖。
