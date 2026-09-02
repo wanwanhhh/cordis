@@ -1,6 +1,7 @@
 use std::sync::{Arc, LazyLock, RwLock};
 
-use cordis::{Context, Dependency, Error, Plugin};
+use async_trait::async_trait;
+use cordis::{Context, Dependency, Error, Plugin, SyncHook};
 
 struct Logger {
     prefix: String,
@@ -14,17 +15,18 @@ impl Logger {
 
 struct LoggerPlugin;
 
+#[async_trait]
 impl Plugin for LoggerPlugin {
     fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
         ctx.provide(Arc::new(RwLock::new(Logger {
             prefix: "logger".to_string(),
         })))?;
 
-        ctx.on_ready(|ctx| {
+        ctx.on_ready(SyncHook(|ctx: &mut Context| {
             let logger = ctx.require::<Arc<RwLock<Logger>>>()?;
             logger.read().unwrap().log("ready");
             Ok(())
-        })?;
+        }))?;
 
         Ok(())
     }
@@ -32,6 +34,7 @@ impl Plugin for LoggerPlugin {
 
 struct AppPlugin;
 
+#[async_trait]
 impl Plugin for AppPlugin {
     fn dependencies(&self) -> &'static [Dependency] {
         static DEPS: LazyLock<[Dependency; 1]> =
@@ -39,27 +42,28 @@ impl Plugin for AppPlugin {
         &DEPS[..]
     }
 
-    fn start(&self, ctx: &Context) -> Result<(), Error> {
+    async fn start(&self, ctx: &Context) -> Result<(), Error> {
         let logger = ctx.require::<Arc<RwLock<Logger>>>()?;
         logger.read().unwrap().log("app start");
         Ok(())
     }
 
-    fn stop(&self, _ctx: &mut Context) -> Result<(), Error> {
+    async fn stop(&self, _ctx: &mut Context) -> Result<(), Error> {
         println!("app stop");
         Ok(())
     }
 }
 
 fn main() -> Result<(), Error> {
-    let mut ctx = Context::new();
+    futures::executor::block_on(async {
+        let mut ctx = Context::new();
 
-    ctx.plugin(LoggerPlugin)?;
-    ctx.plugin(AppPlugin)?;
+        ctx.plugin(LoggerPlugin)?;
+        ctx.plugin(AppPlugin)?;
 
-    // start 前会先检查 AppPlugin 声明的依赖是否满足
-    ctx.start()?;
-    ctx.stop()?;
+        ctx.start().await?;
+        ctx.stop().await?;
 
-    Ok(())
+        Ok(())
+    })
 }

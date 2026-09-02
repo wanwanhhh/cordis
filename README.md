@@ -7,21 +7,23 @@ Rust 实现的 Cordis 风格插件化基础架构。
 ## 文档
 
 - [Cordis 底层约束与开发指导](docs/00-cordis-architecture.md)
+- [异步生命周期与线程安全设计](docs/01-async-lifecycle.md)
 
 ## 当前实现
 
-- `Context`
-- `Scope` / 子 Context
-- `Plugin`
-- `ServiceRegistry`
+- `Context` / `Scope`（支持 Clone、Arc、Send + Sync）
+- `Plugin`（异步 start / stop）
+- `ServiceRegistry`（Send + Sync 服务）
+- `LifecycleHook` / `SyncHook`
 - 服务注册 / 获取
 - 父级服务继承与局部遮蔽
 - 插件依赖声明与检查
 - `apply` 失败回滚
-- ready / dispose 生命周期
+- 异步 ready / dispose 生命周期
 - 启动失败 fail-fast
 - 停止失败继续清理
 - 重复 start / stop 安全 no-op
+- 嵌套 Scope
 - 逆序销毁
 
 ## 运行示例
@@ -29,6 +31,7 @@ Rust 实现的 Cordis 风格插件化基础架构。
 ```bash
 cargo run --example basic
 cargo run --example full
+cargo run --example scopes
 ```
 
 ## 测试

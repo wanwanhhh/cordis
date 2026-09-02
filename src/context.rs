@@ -2,22 +2,44 @@
 
 use std::any::TypeId;
 use std::mem;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
 
 use crate::{Error, Plugin, ServiceRegistry};
 
-type ReadyHook = Box<dyn FnMut(&mut Context) -> Result<(), Error>>;
-type DisposeHook = Box<dyn FnMut(&mut Context) -> Result<(), Error>>;
+type ReadyHook = Box<dyn LifecycleHook>;
+type DisposeHook = Box<dyn LifecycleHook>;
+
+/// 异步生命周期回调。
+///
+/// 用 trait object 替代裸 `Pin<Box<dyn Future>>`，简化注册和存储。
+#[async_trait]
+pub trait LifecycleHook: Send + Sync + 'static {
+    /// 执行回调。
+    async fn call(&mut self, ctx: &mut Context) -> Result<(), Error>;
+}
+
+/// 同步闭包适配器，便于将普通 `FnMut(&mut Context) -> Result<(), Error>` 注册为异步钩子。
+pub struct SyncHook<F>(pub F);
+
+#[async_trait]
+impl<F> LifecycleHook for SyncHook<F>
+where
+    F: for<'a> FnMut(&'a mut Context) -> Result<(), Error> + Send + Sync + 'static,
+{
+    async fn call(&mut self, ctx: &mut Context) -> Result<(), Error> {
+        (self.0)(ctx)
+    }
+}
 
 /// 内部可共享状态。
-///
-/// `Rc` 让 Scope 可以在不引入生命周期泛型的情况下共享父级服务。
 struct ContextInner {
-    parent: Option<Rc<ContextInner>>,
+    parent: Option<Arc<ContextInner>>,
     services: ServiceRegistry,
     plugins: Vec<Box<dyn Plugin>>,
-    ready_hooks: Vec<ReadyHook>,
-    dispose_hooks: Vec<DisposeHook>,
+    ready_hooks: Mutex<Vec<ReadyHook>>,
+    dispose_hooks: Mutex<Vec<DisposeHook>>,
     start_called: bool,
     stopped: bool,
 }
@@ -28,20 +50,20 @@ impl ContextInner {
             parent: None,
             services: ServiceRegistry::new(),
             plugins: Vec::new(),
-            ready_hooks: Vec::new(),
-            dispose_hooks: Vec::new(),
+            ready_hooks: Mutex::new(Vec::new()),
+            dispose_hooks: Mutex::new(Vec::new()),
             start_called: false,
             stopped: false,
         }
     }
 
-    fn child(parent: &Rc<ContextInner>) -> Self {
+    fn child(parent: &Arc<ContextInner>) -> Self {
         Self {
             parent: Some(parent.clone()),
             services: ServiceRegistry::new(),
             plugins: Vec::new(),
-            ready_hooks: Vec::new(),
-            dispose_hooks: Vec::new(),
+            ready_hooks: Mutex::new(Vec::new()),
+            dispose_hooks: Mutex::new(Vec::new()),
             start_called: false,
             stopped: false,
         }
@@ -88,77 +110,66 @@ impl ContextInner {
 
 /// Cordis 核心上下文句柄。
 ///
-/// 内部使用 `Rc` 实现父级服务共享，避免把生命周期暴露给用户。
+/// 内部使用 `Arc`，支持 `Clone` 和跨线程共享。
+#[derive(Clone)]
 pub struct Context {
-    inner: Rc<ContextInner>,
+    inner: Arc<ContextInner>,
 }
 
 impl Context {
     /// 创建一个空的根上下文。
     pub fn new() -> Self {
         Self {
-            inner: Rc::new(ContextInner::new()),
+            inner: Arc::new(ContextInner::new()),
         }
     }
 
     /// 创建一个子上下文（Scope）。
     ///
-    /// Scope 共享父级服务，但在 scope 存活期间父上下文不能执行可变操作。
+    /// Scope 共享父级服务，但在任一后代存活期间父级不能执行可变操作。
     pub fn scope(&self) -> Scope {
         Scope {
             ctx: Context {
-                inner: Rc::new(ContextInner::child(&self.inner)),
+                inner: Arc::new(ContextInner::child(&self.inner)),
             },
         }
     }
 
     /// 注册一个插件。
     ///
-    /// 插件会在注册时调用 `apply`，之后被保存到内部。
-    ///
-    /// 如果 `apply` 失败，该插件本次产生的副作用会被回滚：
-    ///
-    /// - 新注册的服务会被移除
-    /// - 新注册的 ready / dispose 回调会被丢弃
-    /// - 嵌套注册的插件会被移除
-    ///
-    /// 已经成功注册的插件不受影响。
-    pub fn plugin<P: Plugin + 'static>(&mut self, plugin: P) -> Result<(), Error> {
+    /// 如果 `apply` 失败，该插件本次产生的副作用会被回滚。
+    pub fn plugin<P: Plugin>(&mut self, plugin: P) -> Result<(), Error> {
         let snapshot = {
-            let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
             (
                 inner.services.type_ids(),
                 inner.plugins.len(),
-                inner.ready_hooks.len(),
-                inner.dispose_hooks.len(),
+                inner.ready_hooks.lock().unwrap().len(),
+                inner.dispose_hooks.lock().unwrap().len(),
             )
         };
 
         let (service_keys, plugin_len, ready_len, dispose_len) = snapshot;
 
         if let Err(err) = plugin.apply(self) {
-            let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
             inner.services.retain(&service_keys);
             inner.plugins.truncate(plugin_len);
-            inner.ready_hooks.truncate(ready_len);
-            inner.dispose_hooks.truncate(dispose_len);
+            inner.ready_hooks.lock().unwrap().truncate(ready_len);
+            inner.dispose_hooks.lock().unwrap().truncate(dispose_len);
             return Err(Error::PluginApply(err.to_string()));
         }
 
-        let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
         inner.plugins.push(Box::new(plugin));
         Ok(())
     }
 
     /// 批量注册插件。
-    ///
-    /// 不是事务性操作：如果第 N 个插件失败，
-    /// 第 N 个插件自身会回滚，前 N-1 个插件保持已注册状态，
-    /// 后续插件不再继续注册。
     pub fn plugins<I, P>(&mut self, plugins: I) -> Result<(), Error>
     where
         I: IntoIterator<Item = P>,
-        P: Plugin + 'static,
+        P: Plugin,
     {
         for plugin in plugins {
             self.plugin(plugin)?;
@@ -167,8 +178,8 @@ impl Context {
     }
 
     /// 注册服务。
-    pub fn provide<T: 'static>(&mut self, value: T) -> Result<(), Error> {
-        let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+    pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
         inner.services.provide(value)
     }
 
@@ -180,55 +191,41 @@ impl Context {
     }
 
     /// 获取本地服务可变引用。
-    ///
-    /// 父级服务通过子上下文不可变共享，因此这里只访问当前上下文局部服务。
     pub fn require_mut<T: 'static>(&mut self) -> Result<&mut T, Error> {
-        let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
         inner.services.get_mut()
     }
 
-    /// 判断服务是否存在，同时检查局部和父级上下文。
+    /// 判断服务是否存在（局部 + 父级）。
     pub fn contains<T: 'static>(&self) -> bool {
         self.inner.contains::<T>()
     }
 
     /// 注册一个 ready 回调。
-    ///
-    /// 在 `start()` 中，所有插件的 `start()` 执行完毕后调用。
-    pub fn on_ready(
-        &mut self,
-        hook: impl FnMut(&mut Context) -> Result<(), Error> + 'static,
-    ) -> Result<(), Error> {
-        let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-        inner.ready_hooks.push(Box::new(hook));
+    pub fn on_ready(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+        inner.ready_hooks.lock().unwrap().push(Box::new(hook));
         Ok(())
     }
 
     /// 注册一个 dispose 回调。
-    ///
-    /// 在 `stop()` 中，所有插件的 `stop()` 执行完毕后调用。
-    pub fn on_dispose(
-        &mut self,
-        hook: impl FnMut(&mut Context) -> Result<(), Error> + 'static,
-    ) -> Result<(), Error> {
-        let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-        inner.dispose_hooks.push(Box::new(hook));
+    pub fn on_dispose(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+        inner.dispose_hooks.lock().unwrap().push(Box::new(hook));
         Ok(())
     }
 
     /// 检查所有插件的依赖是否满足。
-    ///
-    /// 依赖检查包含局部服务和父级服务。
     pub fn verify_dependencies(&self) -> Result<(), Error> {
         self.inner.verify_dependencies()
     }
 
-    /// 启动上下文。
+    /// 异步启动上下文。
     ///
     /// 只启动当前上下文内注册的插件，不影响父级。
-    pub fn start(&mut self) -> Result<(), Error> {
+    pub async fn start(&mut self) -> Result<(), Error> {
         {
-            let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
             if inner.start_called {
                 return Ok(());
             }
@@ -237,28 +234,28 @@ impl Context {
         }
 
         for plugin in &self.inner.plugins {
-            plugin.start(&*self)?;
+            plugin.start(&*self).await?;
         }
 
         let mut hooks = {
-            let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-            mem::take(&mut inner.ready_hooks)
+            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+            mem::take(&mut *inner.ready_hooks.lock().unwrap())
         };
         for hook in &mut hooks {
-            hook(self)?;
+            hook.call(&mut *self).await?;
         }
 
         Ok(())
     }
 
-    /// 停止上下文。
+    /// 异步停止上下文。
     ///
     /// 只停止当前上下文内注册的插件，不影响父级。
-    pub fn stop(&mut self) -> Result<(), Error> {
+    pub async fn stop(&mut self) -> Result<(), Error> {
         let mut errors = Vec::new();
 
         let plugins = {
-            let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
             if inner.stopped {
                 return Ok(());
             }
@@ -267,22 +264,22 @@ impl Context {
         };
 
         for plugin in plugins.iter().rev() {
-            if let Err(err) = plugin.stop(self) {
+            if let Err(err) = plugin.stop(self).await {
                 errors.push(err);
             }
         }
 
         {
-            let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
             inner.plugins = plugins;
         }
 
         let mut hooks = {
-            let inner = Rc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-            mem::take(&mut inner.dispose_hooks)
+            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
+            mem::take(&mut *inner.dispose_hooks.lock().unwrap())
         };
         for hook in &mut hooks {
-            if let Err(err) = hook(self) {
+            if let Err(err) = hook.call(&mut *self).await {
                 errors.push(err);
             }
         }
@@ -304,13 +301,19 @@ impl Default for Context {
 /// 子上下文。
 ///
 /// 它是共享父级服务的局部 `Context`，用于隔离插件组。
+#[derive(Clone)]
 pub struct Scope {
     ctx: Context,
 }
 
 impl Scope {
+    /// 创建孙级 Scope。
+    pub fn scope(&self) -> Scope {
+        self.ctx.scope()
+    }
+
     /// 注册插件。
-    pub fn plugin<P: Plugin + 'static>(&mut self, plugin: P) -> Result<(), Error> {
+    pub fn plugin<P: Plugin>(&mut self, plugin: P) -> Result<(), Error> {
         self.ctx.plugin(plugin)
     }
 
@@ -318,13 +321,13 @@ impl Scope {
     pub fn plugins<I, P>(&mut self, plugins: I) -> Result<(), Error>
     where
         I: IntoIterator<Item = P>,
-        P: Plugin + 'static,
+        P: Plugin,
     {
         self.ctx.plugins(plugins)
     }
 
     /// 注册局部服务。
-    pub fn provide<T: 'static>(&mut self, value: T) -> Result<(), Error> {
+    pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
         self.ctx.provide(value)
     }
 
@@ -349,28 +352,22 @@ impl Scope {
     }
 
     /// 注册 ready 回调。
-    pub fn on_ready(
-        &mut self,
-        hook: impl FnMut(&mut Context) -> Result<(), Error> + 'static,
-    ) -> Result<(), Error> {
+    pub fn on_ready(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
         self.ctx.on_ready(hook)
     }
 
     /// 注册 dispose 回调。
-    pub fn on_dispose(
-        &mut self,
-        hook: impl FnMut(&mut Context) -> Result<(), Error> + 'static,
-    ) -> Result<(), Error> {
+    pub fn on_dispose(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
         self.ctx.on_dispose(hook)
     }
 
-    /// 启动 scope。
-    pub fn start(&mut self) -> Result<(), Error> {
-        self.ctx.start()
+    /// 异步启动 scope。
+    pub async fn start(&mut self) -> Result<(), Error> {
+        self.ctx.start().await
     }
 
-    /// 停止 scope。
-    pub fn stop(&mut self) -> Result<(), Error> {
-        self.ctx.stop()
+    /// 异步停止 scope。
+    pub async fn stop(&mut self) -> Result<(), Error> {
+        self.ctx.stop().await
     }
 }

@@ -408,6 +408,26 @@ impl Scope {
 }
 ```
 
+#### 嵌套 Scope
+
+`Scope` 可以继续创建子作用域：
+
+```rust
+let ctx = Context::new();
+let session = ctx.scope();
+let subflow = session.scope();
+```
+
+规则：
+
+- 孙级 Scope 可以继承祖父级、父级服务。
+- 孙级 Scope 可以遮蔽祖先服务。
+- 祖先看不到后代的局部服务。
+- 只要有任意后代 Scope 存活，所有祖先的可变操作都返回 `Error::ContextShared`。
+- 推荐启动顺序：先启动根，再启动会话，再启动子流程。
+- 推荐停止顺序：先停止子流程，再停止会话，再停止根。
+- `Scope::stop()` 只清理该层生命周期，不清空局部服务；`Scope` drop 后局部服务不再对外可见。
+
 #### 生命周期规则
 
 `Scope` 作为子 `Context`，继承 `Context` 的完整生命周期语义：
@@ -435,9 +455,14 @@ impl Scope {
 
 - scope 内插件生命周期方法可读取父级服务
 - 局部服务遮蔽与作用域隔离
+- 嵌套 Scope 继承与遮蔽
 - scope 依赖检查可看到父级服务
 - scope 独立 start / stop
 - scope 存活期间父级可变操作返回 `Error::ContextShared`
+- 多个 scope 同时存活时父级持续被禁止可变操作
+- scope 插件 start 失败后 stop 能清理
+- ready / dispose hook 失败语义
+- `on_ready` / `on_dispose` 在 scope 内只执行一次
 - 显式 `Context` 类型创建 scope 不依赖生命周期推断
 
 ---
@@ -691,8 +716,10 @@ pub enum Error {
 | 停止失败继续清理 | 已实现 |
 | 重复 start / stop no-op | 已实现 |
 | Scope / 子 Context | 已实现 |
+| 异步 start / stop | 已实现 |
+| `Plugin: Send + Sync` | 已实现 |
+| `Service: Send + Sync` | 已实现 |
 | EventBus | 未实现 |
-| 异步生命周期 | 未实现（后续另行定义） |
 
 ---
 

@@ -2,6 +2,8 @@
 
 use std::any::TypeId;
 
+use async_trait::async_trait;
+
 use crate::{Context, Error};
 
 /// 插件依赖声明。
@@ -31,10 +33,11 @@ impl Dependency {
 ///
 /// # 生命周期
 ///
-/// - `apply`：插件被装载到 `Context` 时调用，通常用于注册服务。
-/// - `start`：所有插件 apply 完成后调用，用于初始化外部资源。
-/// - `stop`：停止时按逆序调用，用于释放资源。
-pub trait Plugin {
+/// - `apply`：同步，用于注册服务和回调。
+/// - `start`：异步，用于初始化外部资源。
+/// - `stop`：异步，用于释放资源。
+#[async_trait]
+pub trait Plugin: Send + Sync + 'static {
     /// 插件声明的依赖。
     ///
     /// 返回的 slice 必须在整个生命周期内稳定。
@@ -48,20 +51,21 @@ pub trait Plugin {
     }
 
     /// 启动阶段。所有插件已完成 apply。
-    fn start(&self, _ctx: &Context) -> Result<(), Error> {
+    async fn start(&self, _ctx: &Context) -> Result<(), Error> {
         Ok(())
     }
 
     /// 销毁阶段。按注册顺序的逆序调用。
-    fn stop(&self, _ctx: &mut Context) -> Result<(), Error> {
+    async fn stop(&self, _ctx: &mut Context) -> Result<(), Error> {
         Ok(())
     }
 }
 
 /// 允许直接传入一个 `Fn(&mut Context)` 作为插件。
+#[async_trait]
 impl<F> Plugin for F
 where
-    F: Fn(&mut Context) -> Result<(), Error> + 'static,
+    F: Fn(&mut Context) -> Result<(), Error> + Send + Sync + 'static,
 {
     fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
         self(ctx)

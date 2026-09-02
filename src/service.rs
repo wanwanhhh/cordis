@@ -10,7 +10,7 @@ use crate::Error;
 /// 同时保存类型名，用于提供更准确的错误诊断。
 struct StoredService {
     type_name: &'static str,
-    value: Box<dyn Any>,
+    value: Box<dyn Any + Send + Sync>,
 }
 
 /// 服务注册表。
@@ -31,7 +31,7 @@ impl ServiceRegistry {
     /// 注册一个服务。
     ///
     /// 如果该类型已经注册过，则返回 [`Error::ServiceAlreadyRegistered`]。
-    pub fn provide<T: 'static>(&mut self, value: T) -> Result<(), Error> {
+    pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
         let key = TypeId::of::<T>();
         if self.services.contains_key(&key) {
             return Err(Error::ServiceAlreadyRegistered(
@@ -116,8 +116,6 @@ impl ServiceRegistry {
     }
 
     /// 仅保留指定 `TypeId` 集合中的服务。
-    ///
-    /// 用于插件 `apply` 失败时的副作用回滚。
     pub(crate) fn retain(&mut self, keep: &HashSet<TypeId>) {
         self.services.retain(|key, _| keep.contains(key));
     }
