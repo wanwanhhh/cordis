@@ -1,7 +1,7 @@
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use cordis::{Context, Dependency, Error, Plugin, SyncHook};
+use cordis::{Builder, Configurator, Context, Dependency, Error, Plugin, SyncHook};
 
 struct Logger {
     prefix: String,
@@ -17,12 +17,12 @@ struct LoggerPlugin;
 
 #[async_trait]
 impl Plugin for LoggerPlugin {
-    fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
-        ctx.provide(Arc::new(RwLock::new(Logger {
+    fn apply(&self, cfg: &mut Configurator<'_>) -> Result<(), Error> {
+        cfg.provide(Arc::new(RwLock::new(Logger {
             prefix: "logger".to_string(),
         })))?;
 
-        ctx.on_ready(SyncHook(|ctx: &mut Context| {
+        cfg.on_ready(SyncHook(|ctx: &Context| {
             let logger = ctx.require::<Arc<RwLock<Logger>>>()?;
             logger.read().unwrap().log("ready");
             Ok(())
@@ -36,10 +36,8 @@ struct AppPlugin;
 
 #[async_trait]
 impl Plugin for AppPlugin {
-    fn dependencies(&self) -> &'static [Dependency] {
-        static DEPS: LazyLock<[Dependency; 1]> =
-            LazyLock::new(|| [Dependency::of::<Arc<RwLock<Logger>>>()]);
-        &DEPS[..]
+    fn dependencies(&self) -> Vec<Dependency> {
+        vec![Dependency::of::<Arc<RwLock<Logger>>>()]
     }
 
     async fn start(&self, ctx: &Context) -> Result<(), Error> {
@@ -48,7 +46,7 @@ impl Plugin for AppPlugin {
         Ok(())
     }
 
-    async fn stop(&self, _ctx: &mut Context) -> Result<(), Error> {
+    async fn stop(&self, _ctx: &Context) -> Result<(), Error> {
         println!("app stop");
         Ok(())
     }
@@ -56,13 +54,14 @@ impl Plugin for AppPlugin {
 
 fn main() -> Result<(), Error> {
     futures::executor::block_on(async {
-        let mut ctx = Context::new();
+        let mut builder = Builder::new();
 
-        ctx.plugin(LoggerPlugin)?;
-        ctx.plugin(AppPlugin)?;
+        builder.plugin(LoggerPlugin)?;
+        builder.plugin(AppPlugin)?;
 
-        ctx.start().await?;
-        ctx.stop().await?;
+        let mut rt = builder.build()?;
+        rt.start().await?;
+        rt.stop().await?;
 
         Ok(())
     })

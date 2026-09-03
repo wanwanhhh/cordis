@@ -1,56 +1,45 @@
-//! 核心上下文与 Scope。
+//! 三段式上下文模型：Builder / Context / Runtime。
 
 use std::any::TypeId;
+use std::collections::HashSet;
 use std::future::Future;
-use std::mem;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 
 use crate::event::{ErasedEventHandler, Subscription, TypedEventHandler};
-use crate::{Error, Event, EventControl, EventHandler, Plugin, ServiceRegistry};
+use crate::{Error, ErrorKind, Event, EventControl, EventHandler, Phase, Plugin, ServiceRegistry};
 
 static NEXT_CONTEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+const STOPPED: u64 = 1 << 63;
+const COUNT_MASK: u64 = STOPPED - 1;
 
 type ReadyHook = Box<dyn LifecycleHook>;
 type DisposeHook = Box<dyn LifecycleHook>;
 
 /// 异步生命周期回调。
-///
-/// 用 trait object 替代裸 `Pin<Box<dyn Future>>`，简化注册和存储。
 #[async_trait]
 pub trait LifecycleHook: Send + Sync + 'static {
-    /// 执行回调。
-    async fn call(&mut self, ctx: &mut Context) -> Result<(), Error>;
+    /// 执行回调。回调只获得只读 `Context`。
+    async fn call(&mut self, ctx: &Context) -> Result<(), Error>;
 }
 
-/// 同步闭包适配器，便于将普通 `FnMut(&mut Context) -> Result<(), Error>` 注册为异步钩子。
+/// 同步闭包适配器，便于将普通 `FnMut(&Context) -> Result<(), Error>` 注册为异步钩子。
 pub struct SyncHook<F>(pub F);
 
 #[async_trait]
 impl<F> LifecycleHook for SyncHook<F>
 where
-    F: for<'a> FnMut(&'a mut Context) -> Result<(), Error> + Send + Sync + 'static,
+    F: for<'a> FnMut(&'a Context) -> Result<(), Error> + Send + Sync + 'static,
 {
-    async fn call(&mut self, ctx: &mut Context) -> Result<(), Error> {
+    async fn call(&mut self, ctx: &Context) -> Result<(), Error> {
         (self.0)(ctx)
     }
 }
 
 /// 异步闭包适配器，用于注册异步生命周期回调。
-///
-/// 回调接收一个克隆后的 `Context`，便于在异步任务中读取服务并向 runtime 共享。
-///
-/// 用法：
-///
-/// ```ignore
-/// ctx.on_ready(AsyncHook(|ctx: Context| async move {
-///     let service = ctx.require::<MyService>()?;
-///     service.init().await?;
-///     Ok(())
-/// }))?;
-/// ```
 pub struct AsyncHook<F>(pub F);
 
 #[async_trait]
@@ -59,73 +48,64 @@ where
     F: FnMut(Context) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), Error>> + Send + 'static,
 {
-    async fn call(&mut self, ctx: &mut Context) -> Result<(), Error> {
+    async fn call(&mut self, ctx: &Context) -> Result<(), Error> {
         let ctx = ctx.clone();
         (self.0)(ctx).await
     }
 }
 
-/// 内部可共享状态。
-struct ContextInner {
+/// 数据面：build 后只读，由 `Context` 的 `Arc` 共享。
+struct Data {
     context_id: usize,
-    parent: Option<Arc<ContextInner>>,
+    parent: Option<Arc<Data>>,
     services: ServiceRegistry,
-    plugins: Vec<Box<dyn Plugin>>,
     plugin_names: Vec<&'static str>,
-    ready_hooks: Mutex<Vec<ReadyHook>>,
-    dispose_hooks: Mutex<Vec<DisposeHook>>,
-    event_handlers: Mutex<Vec<Arc<dyn ErasedEventHandler>>>,
+    event_handlers: Vec<Arc<dyn ErasedEventHandler>>,
     next_subscription_id: usize,
-    start_order: Vec<usize>,
-    start_called: bool,
-    stopped: bool,
+    state: AtomicU64,
 }
 
-impl ContextInner {
-    fn new() -> Self {
+impl Data {
+    fn root() -> Self {
         Self {
             context_id: NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed),
             parent: None,
             services: ServiceRegistry::new(),
-            plugins: Vec::new(),
             plugin_names: Vec::new(),
-            ready_hooks: Mutex::new(Vec::new()),
-            dispose_hooks: Mutex::new(Vec::new()),
-            event_handlers: Mutex::new(Vec::new()),
+            event_handlers: Vec::new(),
             next_subscription_id: 0,
-            start_order: Vec::new(),
-            start_called: false,
-            stopped: false,
+            state: AtomicU64::new(0),
         }
     }
 
-    fn child(parent: &Arc<ContextInner>) -> Self {
+    fn child(parent: Arc<Data>) -> Self {
         Self {
             context_id: NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed),
-            parent: Some(parent.clone()),
+            parent: Some(parent),
             services: ServiceRegistry::new(),
-            plugins: Vec::new(),
             plugin_names: Vec::new(),
-            ready_hooks: Mutex::new(Vec::new()),
-            dispose_hooks: Mutex::new(Vec::new()),
-            event_handlers: Mutex::new(Vec::new()),
+            event_handlers: Vec::new(),
             next_subscription_id: 0,
-            start_order: Vec::new(),
-            start_called: false,
-            stopped: false,
+            state: AtomicU64::new(0),
         }
     }
 
     fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
         match self.services.get::<T>() {
             Ok(value) => Ok(value),
-            Err(Error::ServiceNotFound(_)) => match &self.parent {
-                Some(parent) => parent.require::<T>(),
-                None => Err(Error::ServiceNotFound(
-                    std::any::type_name::<T>().to_string(),
-                )),
-            },
-            Err(err) => Err(err),
+            Err(err) => {
+                if matches!(err.kind, ErrorKind::ServiceNotFound(_)) {
+                    match &self.parent {
+                        Some(parent) => parent.require::<T>(),
+                        None => Err(Error::new(
+                            Phase::Build,
+                            ErrorKind::ServiceNotFound(std::any::type_name::<T>().to_string()),
+                        )),
+                    }
+                } else {
+                    Err(err)
+                }
+            }
         }
     }
 
@@ -159,8 +139,6 @@ impl ContextInner {
 
     fn event_handlers_for<E: Event>(&self) -> Vec<Arc<dyn ErasedEventHandler>> {
         self.event_handlers
-            .lock()
-            .unwrap()
             .iter()
             .filter(|handler| handler.event_type_id() == std::any::TypeId::of::<E>())
             .cloned()
@@ -176,155 +154,254 @@ impl ContextInner {
             None => false,
         }
     }
+}
 
-    fn compute_start_order(&self) -> Result<Vec<usize>, Error> {
-        let n = self.plugins.len();
-        let mut indegree = vec![0usize; n];
-        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+type Snapshot = (
+    HashSet<TypeId>,
+    usize,
+    usize,
+    usize,
+    usize,
+    Vec<Arc<dyn ErasedEventHandler>>,
+    usize,
+);
 
-        for (i, plugin) in self.plugins.iter().enumerate() {
-            for plugin_dependency in plugin.plugin_dependencies() {
-                match self
-                    .plugin_names
-                    .iter()
-                    .position(|name| *name == plugin_dependency.plugin_name)
-                {
-                    Some(j) => {
-                        dependents[j].push(i);
-                        indegree[i] += 1;
-                    }
-                    None => {
-                        // 目标插件可能位于父级 Scope：依赖检查已通过时不需要本地排序边。
-                        if !plugin_dependency.optional
-                            && !self.has_plugin(plugin_dependency.plugin_name)
-                        {
-                            return Err(Error::PluginDependencyNotFound(
-                                plugin_dependency.plugin_name.to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+/// 缓存插件注册时求值的依赖信息。
+struct PluginRecord {
+    plugin: Box<dyn Plugin>,
+    deps: Vec<crate::Dependency>,
+    plugin_deps: Vec<crate::PluginDependency>,
+}
 
-        let mut order = Vec::with_capacity(n);
-        let mut remaining: Vec<usize> = (0..n).collect();
-
-        while !remaining.is_empty() {
-            let candidates: Vec<usize> = remaining
-                .iter()
-                .copied()
-                .filter(|&index| indegree[index] == 0)
-                .collect();
-
-            if candidates.is_empty() {
-                return Err(Error::PluginDependencyCycle);
-            }
-
-            let next = *candidates
-                .iter()
-                .max_by(|&&a, &&b| {
-                    self.plugins[a]
-                        .priority()
-                        .cmp(&self.plugins[b].priority())
-                        .then(b.cmp(&a))
-                })
-                .expect("candidates is not empty");
-
-            order.push(next);
-
-            for &dependent in &dependents[next] {
-                indegree[dependent] -= 1;
-            }
-
-            remaining.retain(|&index| index != next);
-        }
-
-        Ok(order)
+impl PluginRecord {
+    fn name(&self) -> &'static str {
+        self.plugin.name()
     }
 
-    fn verify_dependencies(&self) -> Result<(), Error> {
-        for plugin in &self.plugins {
-            for dependency in plugin.dependencies() {
-                if !dependency.optional && !self.contains_type(dependency.type_id) {
-                    return Err(Error::ServiceNotFound(dependency.name.to_string()));
-                }
-            }
-
-            for plugin_dependency in plugin.plugin_dependencies() {
-                if !plugin_dependency.optional && !self.has_plugin(plugin_dependency.plugin_name) {
-                    return Err(Error::PluginDependencyNotFound(
-                        plugin_dependency.plugin_name.to_string(),
-                    ));
-                }
-            }
-        }
-        Ok(())
+    fn priority(&self) -> i32 {
+        self.plugin.priority()
     }
 }
 
-/// Cordis 核心上下文句柄。
+/// 统一的插件依赖拓扑排序。
 ///
-/// 内部使用 `Arc`，支持 `Clone` 和跨线程共享。
-#[derive(Clone)]
-pub struct Context {
-    inner: Arc<ContextInner>,
+/// `local_names` 是本层已注册插件名；`has_plugin` 用于检查父级插件是否存在。
+/// 可选插件依赖只放宽“必须存在”的校验，不改变“存在则必须按依赖顺序启动”的语义。
+fn compute_start_order(
+    plugins: &[PluginRecord],
+    local_names: &[&'static str],
+    has_plugin: impl Fn(&str) -> bool,
+) -> Result<Vec<usize>, Error> {
+    let n = plugins.len();
+    let mut indegree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, record) in plugins.iter().enumerate() {
+        for plugin_dependency in &record.plugin_deps {
+            match local_names
+                .iter()
+                .position(|name| *name == plugin_dependency.plugin_name)
+            {
+                Some(j) => {
+                    dependents[j].push(i);
+                    indegree[i] += 1;
+                }
+                None => {
+                    // 目标插件可能位于父级：依赖检查已通过时不需要本地排序边。
+                    if !plugin_dependency.optional && !has_plugin(plugin_dependency.plugin_name) {
+                        return Err(Error::new(
+                            Phase::Verify,
+                            ErrorKind::PluginDependencyNotFound(
+                                plugin_dependency.plugin_name.to_string(),
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut order = Vec::with_capacity(n);
+    let mut remaining: Vec<usize> = (0..n).collect();
+
+    while !remaining.is_empty() {
+        let candidates: Vec<usize> = remaining
+            .iter()
+            .copied()
+            .filter(|&index| indegree[index] == 0)
+            .collect();
+
+        if candidates.is_empty() {
+            return Err(Error::new(Phase::Verify, ErrorKind::PluginDependencyCycle));
+        }
+
+        let next = *candidates
+            .iter()
+            .max_by(|&&a, &&b| {
+                plugins[a]
+                    .priority()
+                    .cmp(&plugins[b].priority())
+                    .then(b.cmp(&a))
+            })
+            .expect("candidates is not empty");
+
+        order.push(next);
+
+        for &dependent in &dependents[next] {
+            indegree[dependent] -= 1;
+        }
+
+        remaining.retain(|&index| index != next);
+    }
+
+    Ok(order)
 }
 
-impl Context {
-    /// 创建一个空的根上下文。
+/// 把拓扑序切分为可并发的层。
+///
+/// 同一层内没有尚未启动的本地插件依赖；父级插件依赖不产生本地层间边。
+fn compute_start_layers(
+    plugins: &[PluginRecord],
+    order: &[usize],
+) -> Result<Vec<Vec<usize>>, Error> {
+    let mut remaining: Vec<usize> = order.to_vec();
+    let mut layers = Vec::new();
+
+    while !remaining.is_empty() {
+        let mut layer = Vec::new();
+        let mut next_remaining = Vec::new();
+
+        for &index in &remaining {
+            let depends_on_remaining = plugins[index].plugin_deps.iter().any(|dep| {
+                remaining
+                    .iter()
+                    .any(|&r| plugins[r].name() == dep.plugin_name)
+            });
+
+            if depends_on_remaining {
+                next_remaining.push(index);
+            } else {
+                layer.push(index);
+            }
+        }
+
+        if layer.is_empty() {
+            // 该状态与拓扑排序结果矛盾，说明内部依赖解析不一致；应直接暴露，避免静默死循环。
+            return Err(Error::new(Phase::Start, ErrorKind::PluginDependencyCycle));
+        }
+
+        layers.push(layer);
+        remaining = next_remaining;
+    }
+
+    Ok(layers)
+}
+
+/// 子作用域租约：持有父 `Data` 强引用，`Drop` 时归还父计数。
+struct ScopeLease(Arc<Data>);
+
+impl Drop for ScopeLease {
+    fn drop(&mut self) {
+        self.0.state.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// 装配阶段：独占 `&mut`，不 `Clone`。
+pub struct Builder {
+    data: Data,
+    plugins: Vec<PluginRecord>,
+    ready: Vec<ReadyHook>,
+    dispose: Vec<DisposeHook>,
+    lease: Option<ScopeLease>,
+}
+
+impl Builder {
+    /// 创建一个空的根 Builder。
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(ContextInner::new()),
+            data: Data::root(),
+            plugins: Vec::new(),
+            ready: Vec::new(),
+            dispose: Vec::new(),
+            lease: None,
         }
     }
 
-    /// 创建一个子上下文（Scope）。
-    ///
-    /// Scope 共享父级服务，但在任一后代存活期间父级不能执行可变操作。
-    pub fn scope(&self) -> Scope {
-        Scope {
-            ctx: Context {
-                inner: Arc::new(ContextInner::child(&self.inner)),
-            },
+    fn child(parent: Arc<Data>, lease: ScopeLease) -> Self {
+        Self {
+            data: Data::child(parent),
+            plugins: Vec::new(),
+            ready: Vec::new(),
+            dispose: Vec::new(),
+            lease: Some(lease),
         }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        (
+            self.data.services.type_ids(),
+            self.plugins.len(),
+            self.data.plugin_names.len(),
+            self.ready.len(),
+            self.dispose.len(),
+            self.data.event_handlers.clone(),
+            self.data.next_subscription_id,
+        )
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) {
+        let (
+            service_keys,
+            plugin_len,
+            plugin_names_len,
+            ready_len,
+            dispose_len,
+            event_handlers,
+            next_subscription_id,
+        ) = snapshot;
+        self.data.services.retain(&service_keys);
+        self.plugins.truncate(plugin_len);
+        self.data.plugin_names.truncate(plugin_names_len);
+        self.ready.truncate(ready_len);
+        self.dispose.truncate(dispose_len);
+        self.data.event_handlers = event_handlers;
+        self.data.next_subscription_id = next_subscription_id;
     }
 
     /// 注册一个插件。
     ///
-    /// 如果 `apply` 失败，该插件本次产生的副作用会被回滚。
+    /// 插件依赖在注册时求值并缓存。如果 `apply` 失败，本插件产生的所有副作用
+    /// 会回滚到进入 `apply` 之前的状态。
     pub fn plugin<P: Plugin>(&mut self, plugin: P) -> Result<(), Error> {
         let name = plugin.name();
+        let deps = plugin.dependencies();
+        let plugin_deps = plugin.plugin_dependencies();
 
-        let snapshot = {
-            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-            if inner.plugin_names.contains(&name) {
-                return Err(Error::PluginNameAlreadyRegistered(name.to_string()));
-            }
-            (
-                inner.services.type_ids(),
-                inner.plugins.len(),
-                inner.plugin_names.len(),
-                inner.ready_hooks.lock().unwrap().len(),
-                inner.dispose_hooks.lock().unwrap().len(),
-            )
-        };
-
-        let (service_keys, plugin_len, plugin_names_len, ready_len, dispose_len) = snapshot;
-
-        if let Err(err) = plugin.apply(self) {
-            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-            inner.services.retain(&service_keys);
-            inner.plugins.truncate(plugin_len);
-            inner.plugin_names.truncate(plugin_names_len);
-            inner.ready_hooks.lock().unwrap().truncate(ready_len);
-            inner.dispose_hooks.lock().unwrap().truncate(dispose_len);
-            return Err(Error::PluginApply(err.to_string()));
+        if self.data.plugin_names.contains(&name) {
+            return Err(Error::new(
+                Phase::Build,
+                ErrorKind::PluginNameAlreadyRegistered(name.to_string()),
+            ));
         }
 
-        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-        inner.plugins.push(Box::new(plugin));
-        inner.plugin_names.push(name);
+        let snapshot = self.snapshot();
+
+        let apply_result = {
+            let mut cfg = Configurator { builder: self };
+            plugin.apply(&mut cfg)
+        };
+
+        if let Err(err) = apply_result {
+            self.restore(snapshot);
+            return Err(err.into_phase(Phase::Apply, Some(name)));
+        }
+
+        self.plugins.push(PluginRecord {
+            plugin: Box::new(plugin),
+            deps,
+            plugin_deps,
+        });
+        self.data.plugin_names.push(name);
         Ok(())
     }
 
@@ -342,23 +419,18 @@ impl Context {
 
     /// 注册插件并注入配置。
     ///
-    /// 配置会以 `C` 类型作为当前 Context 的服务注入；插件可通过 `require::<C>()` 读取。
+    /// 配置会以 `C` 类型作为当前 Builder 的服务注入；插件可通过 `require::<C>()` 读取。
     /// 如果插件 `apply` 失败，配置服务也会一起回滚。
     pub fn plugin_with_config<P, C>(&mut self, plugin: P, config: C) -> Result<(), Error>
     where
         P: Plugin,
         C: Send + Sync + 'static,
     {
-        let snapshot = {
-            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-            inner.services.type_ids()
-        };
-
+        let snapshot = self.data.services.type_ids();
         self.provide(config)?;
 
         if let Err(err) = self.plugin(plugin) {
-            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-            inner.services.retain(&snapshot);
+            self.data.services.retain(&snapshot);
             return Err(err);
         }
 
@@ -367,8 +439,7 @@ impl Context {
 
     /// 注册服务。
     pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
-        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-        inner.services.provide(value)
+        self.data.services.provide(value)
     }
 
     /// 注册一个懒加载服务工厂。
@@ -376,14 +447,310 @@ impl Context {
         &mut self,
         factory: impl Fn() -> Result<T, Error> + Send + Sync + 'static,
     ) -> Result<(), Error> {
-        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-        inner.services.provide_factory(factory)
+        self.data.services.provide_factory(factory)
     }
 
     /// 注册一个集合服务实现。
     pub fn provide_collect<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
-        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-        inner.services.provide_collect(value)
+        self.data.services.provide_collect(value)
+    }
+
+    /// 尝试获取服务（普通服务或工厂，含父级）。
+    pub fn try_require<T: Send + Sync + 'static>(&self) -> Result<Option<&T>, Error> {
+        self.data.try_require()
+    }
+
+    /// 获取本层局部集合中的所有实现。
+    pub fn require_all<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
+        self.data.all()
+    }
+
+    /// 获取服务引用。
+    pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
+        self.data.require()
+    }
+
+    /// 获取本地服务可变引用（仅构建期可调用）。
+    pub fn require_mut<T: Send + Sync + 'static>(&mut self) -> Result<&mut T, Error> {
+        self.data.services.get_mut()
+    }
+
+    /// 判断服务是否存在（局部 + 父级）。
+    pub fn contains<T: Send + Sync + 'static>(&self) -> bool {
+        self.data.contains::<T>()
+    }
+
+    /// 判断某个插件是否已注册（局部 + 父级）。
+    pub fn has_plugin(&self, name: &str) -> bool {
+        self.data.has_plugin(name)
+    }
+
+    /// 注册一个 ready 回调。
+    pub fn on_ready(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
+        self.ready.push(Box::new(hook));
+        Ok(())
+    }
+
+    /// 注册一个 dispose 回调。
+    pub fn on_dispose(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
+        self.dispose.push(Box::new(hook));
+        Ok(())
+    }
+
+    /// 注册一个事件 handler。
+    pub fn on<E, H>(&mut self, handler: H) -> Result<Subscription, Error>
+    where
+        E: Event,
+        H: EventHandler<E>,
+    {
+        let id = self.data.next_subscription_id;
+        self.data.next_subscription_id += 1;
+        self.data
+            .event_handlers
+            .push(Arc::new(TypedEventHandler::new(id, handler)));
+        Ok(Subscription {
+            context_id: self.data.context_id,
+            handler_id: id,
+        })
+    }
+
+    /// 取消一个事件订阅。
+    pub fn off(&mut self, subscription: Subscription) -> Result<(), Error> {
+        if subscription.context_id != self.data.context_id {
+            return Err(Error::new(Phase::Build, ErrorKind::SubscriptionNotFound));
+        }
+
+        if let Some(index) = self
+            .data
+            .event_handlers
+            .iter()
+            .position(|handler| handler.id() == subscription.handler_id)
+        {
+            self.data.event_handlers.remove(index);
+            Ok(())
+        } else {
+            Err(Error::new(Phase::Build, ErrorKind::SubscriptionNotFound))
+        }
+    }
+
+    /// 校验依赖：服务依赖、插件依赖和环。
+    pub fn verify(&self) -> Result<(), Error> {
+        self.verify_dependencies()
+    }
+
+    /// 校验所有插件的依赖是否满足。
+    pub fn verify_dependencies(&self) -> Result<(), Error> {
+        for record in &self.plugins {
+            for dependency in &record.deps {
+                if !dependency.optional && !self.data.contains_type(dependency.type_id) {
+                    return Err(Error::new(
+                        Phase::Verify,
+                        ErrorKind::ServiceNotFound(dependency.name.to_string()),
+                    ));
+                }
+            }
+
+            for plugin_dependency in &record.plugin_deps {
+                if !plugin_dependency.optional
+                    && !self.data.has_plugin(plugin_dependency.plugin_name)
+                {
+                    return Err(Error::new(
+                        Phase::Verify,
+                        ErrorKind::PluginDependencyNotFound(
+                            plugin_dependency.plugin_name.to_string(),
+                        ),
+                    ));
+                }
+            }
+        }
+
+        self.compute_start_order()?;
+        Ok(())
+    }
+
+    fn compute_start_order(&self) -> Result<Vec<usize>, Error> {
+        compute_start_order(&self.plugins, &self.data.plugin_names, |name| {
+            self.data.has_plugin(name)
+        })
+    }
+
+    /// 消费 Builder 并产出唯一冻结的 Runtime。
+    ///
+    /// 冻结点是唯一一次 `Arc::new(data)`。
+    pub fn build(self) -> Result<Runtime, Error> {
+        self.verify()?;
+
+        let Builder {
+            data,
+            plugins,
+            ready,
+            dispose,
+            lease,
+        } = self;
+
+        Ok(Runtime {
+            ctx: Context {
+                inner: Arc::new(data),
+            },
+            plugins,
+            ready,
+            dispose,
+            started: false,
+            stopped: false,
+            started_plugins: Vec::new(),
+            _lease: lease,
+        })
+    }
+
+    /// 消费 Builder；校验失败时把 Builder（含租约）完整带回。
+    #[allow(clippy::result_large_err)]
+    pub fn try_build(self) -> Result<Runtime, (Builder, Error)> {
+        if let Err(err) = self.verify() {
+            return Err((self, err));
+        }
+
+        Ok(self.build().expect("verify() already succeeded"))
+    }
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 插件 `apply` 阶段使用的窄接口。
+pub struct Configurator<'a> {
+    builder: &'a mut Builder,
+}
+
+impl Configurator<'_> {
+    /// 尝试获取服务（普通服务或工厂，含父级）。
+    pub fn try_require<T: Send + Sync + 'static>(&self) -> Result<Option<&T>, Error> {
+        self.builder.try_require()
+    }
+
+    /// 获取本层局部集合中的所有实现。
+    pub fn require_all<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
+        self.builder.require_all()
+    }
+
+    /// 获取服务引用。
+    pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
+        self.builder.require()
+    }
+
+    /// 判断服务是否存在（局部 + 父级）。
+    pub fn contains<T: Send + Sync + 'static>(&self) -> bool {
+        self.builder.contains::<T>()
+    }
+
+    /// 判断某个插件是否已注册（局部 + 父级）。
+    pub fn has_plugin(&self, name: &str) -> bool {
+        self.builder.has_plugin(name)
+    }
+
+    /// 注册服务。
+    pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
+        self.builder.provide(value)
+    }
+
+    /// 注册一个懒加载服务工厂。
+    pub fn provide_factory<T: Send + Sync + 'static>(
+        &mut self,
+        factory: impl Fn() -> Result<T, Error> + Send + Sync + 'static,
+    ) -> Result<(), Error> {
+        self.builder.provide_factory(factory)
+    }
+
+    /// 注册一个集合服务实现。
+    pub fn provide_collect<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
+        self.builder.provide_collect(value)
+    }
+
+    /// 注册子插件。
+    pub fn plugin<P: Plugin>(&mut self, plugin: P) -> Result<(), Error> {
+        self.builder.plugin(plugin)
+    }
+
+    /// 批量注册子插件。
+    pub fn plugins<I, P>(&mut self, plugins: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = P>,
+        P: Plugin,
+    {
+        self.builder.plugins(plugins)
+    }
+
+    /// 注册子插件并注入配置。
+    pub fn plugin_with_config<P, C>(&mut self, plugin: P, config: C) -> Result<(), Error>
+    where
+        P: Plugin,
+        C: Send + Sync + 'static,
+    {
+        self.builder.plugin_with_config(plugin, config)
+    }
+
+    /// 注册 ready 回调。
+    pub fn on_ready(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
+        self.builder.on_ready(hook)
+    }
+
+    /// 注册 dispose 回调。
+    pub fn on_dispose(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
+        self.builder.on_dispose(hook)
+    }
+
+    /// 注册事件 handler。
+    pub fn on<E, H>(&mut self, handler: H) -> Result<Subscription, Error>
+    where
+        E: Event,
+        H: EventHandler<E>,
+    {
+        self.builder.on(handler)
+    }
+
+    /// 取消事件订阅。
+    pub fn off(&mut self, subscription: Subscription) -> Result<(), Error> {
+        self.builder.off(subscription)
+    }
+}
+
+/// 只读数据句柄；`Clone + Send + Sync`。
+#[derive(Clone)]
+pub struct Context {
+    inner: Arc<Data>,
+}
+
+impl Context {
+    /// 创建一个子 Builder。
+    ///
+    /// 该方法会在父 `Data.state` 上原子的递增 child 计数；若父已进入停止，
+    /// 返回 `ErrorKind::Stopping`。
+    pub fn scope(&self) -> Result<Builder, Error> {
+        loop {
+            let s = self.inner.state.load(Ordering::Acquire);
+            if s & STOPPED != 0 {
+                return Err(Error::new(Phase::Build, ErrorKind::Stopping));
+            }
+            if s & COUNT_MASK == COUNT_MASK {
+                return Err(Error::new(Phase::Build, ErrorKind::TooManyScopes));
+            }
+            match self.inner.state.compare_exchange_weak(
+                s,
+                s + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Ok(Builder::child(
+                        self.inner.clone(),
+                        ScopeLease(self.inner.clone()),
+                    ));
+                }
+                Err(_) => continue,
+            }
+        }
     }
 
     /// 尝试获取服务（普通服务或工厂，含父级）。
@@ -397,16 +764,8 @@ impl Context {
     }
 
     /// 获取服务引用。
-    ///
-    /// 查找顺序：当前上下文局部服务 -> 父级上下文服务（递归）。
     pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
         self.inner.require()
-    }
-
-    /// 获取本地服务可变引用。
-    pub fn require_mut<T: Send + Sync + 'static>(&mut self) -> Result<&mut T, Error> {
-        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-        inner.services.get_mut()
     }
 
     /// 判断服务是否存在（局部 + 父级）。
@@ -419,70 +778,18 @@ impl Context {
         self.inner.has_plugin(name)
     }
 
-    /// 注册一个 ready 回调。
-    pub fn on_ready(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
-        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-        inner.ready_hooks.lock().unwrap().push(Box::new(hook));
-        Ok(())
+    /// 测试用：读取本层活跃子 Runtime/Builder 的租约计数。
+    #[cfg(test)]
+    pub(crate) fn child_count(&self) -> u64 {
+        self.inner.state.load(Ordering::SeqCst) & COUNT_MASK
     }
 
-    /// 注册一个 dispose 回调。
-    pub fn on_dispose(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
-        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-        inner.dispose_hooks.lock().unwrap().push(Box::new(hook));
-        Ok(())
-    }
-
-    /// 检查所有插件的依赖是否满足。
-    pub fn verify_dependencies(&self) -> Result<(), Error> {
-        self.inner.verify_dependencies()
-    }
-
-    /// 注册一个事件 handler。
-    pub fn on<E, H>(&mut self, handler: H) -> Result<Subscription, Error>
-    where
-        E: Event,
-        H: EventHandler<E>,
-    {
-        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-        let id = inner.next_subscription_id;
-        inner.next_subscription_id += 1;
-        inner
-            .event_handlers
-            .lock()
-            .unwrap()
-            .push(Arc::new(TypedEventHandler::new(id, handler)));
-        Ok(Subscription {
-            context_id: inner.context_id,
-            handler_id: id,
-        })
-    }
-
-    /// 取消一个事件订阅。
-    pub fn off(&mut self, subscription: Subscription) -> Result<(), Error> {
-        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-        if subscription.context_id != inner.context_id {
-            return Err(Error::SubscriptionNotFound);
-        }
-
-        let mut handlers = inner.event_handlers.lock().unwrap();
-        if let Some(index) = handlers
-            .iter()
-            .position(|handler| handler.id() == subscription.handler_id)
-        {
-            handlers.remove(index);
-            Ok(())
-        } else {
-            Err(Error::SubscriptionNotFound)
-        }
-    }
-
-    /// 串行发出事件，并沿 Scope 向上冒泡。
+    /// 串行发出事件，并沿父链向上冒泡。
     pub async fn emit<E: Event>(&self, event: E) -> Result<(), Error> {
         self.emit_impl(event, false).await
     }
 
-    /// 并发发出事件，并沿 Scope 向上冒泡。
+    /// 并发发出事件，并沿父链向上冒泡。
     pub async fn emit_parallel<E: Event>(&self, event: E) -> Result<(), Error> {
         self.emit_impl(event, true).await
     }
@@ -492,10 +799,13 @@ impl Context {
 
         while let Some(inner) = current {
             let handlers = inner.event_handlers_for::<E>();
+            let ctx = Context {
+                inner: inner.clone(),
+            };
 
             if parallel {
                 let results = futures::future::join_all(
-                    handlers.iter().map(|handler| handler.call(&event, &*self)),
+                    handlers.iter().map(|handler| handler.call(&event, &ctx)),
                 )
                 .await;
 
@@ -510,14 +820,14 @@ impl Context {
                 }
 
                 if !errors.is_empty() {
-                    return Err(Error::Multiple(errors));
+                    return Err(Error::new(Phase::Event, ErrorKind::Multiple(errors)));
                 }
                 if bail {
                     return Ok(());
                 }
             } else {
                 for handler in &handlers {
-                    match handler.call(&event, self).await {
+                    match handler.call(&event, &ctx).await {
                         Ok(EventControl::Continue) => {}
                         Ok(EventControl::Bail) => return Ok(()),
                         Err(err) => return Err(err),
@@ -530,226 +840,174 @@ impl Context {
 
         Ok(())
     }
+}
 
-    /// 异步启动上下文。
-    ///
-    /// 只启动当前上下文内注册的插件，不影响父级。
-    pub async fn start(&mut self) -> Result<(), Error> {
-        let order = {
-            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-            if inner.start_called {
-                return Ok(());
-            }
-            inner.verify_dependencies()?;
-            let order = inner.compute_start_order()?;
-            inner.start_order = order.clone();
-            inner.start_called = true;
-            order
-        };
+/// 生命周期唯一所有者；不 `Clone`，`#[must_use]`。
+#[must_use]
+pub struct Runtime {
+    ctx: Context,
+    plugins: Vec<PluginRecord>,
+    ready: Vec<ReadyHook>,
+    dispose: Vec<DisposeHook>,
+    started: bool,
+    stopped: bool,
+    started_plugins: Vec<usize>,
+    /// 私有租约必须作为最后一个字段声明，确保在插件字段析构之后归还父计数。
+    #[allow(dead_code)]
+    _lease: Option<ScopeLease>,
+}
 
-        for index in order {
-            self.inner.plugins[index].start(&*self).await?;
-        }
-
-        let mut hooks = {
-            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-            mem::take(&mut *inner.ready_hooks.lock().unwrap())
-        };
-        for hook in &mut hooks {
-            hook.call(&mut *self).await?;
-        }
-
-        Ok(())
+impl Runtime {
+    /// 获取只读 `Context` 句柄。
+    pub fn handle(&self) -> Context {
+        self.ctx.clone()
     }
 
-    /// 异步停止上下文。
-    ///
-    /// 只停止当前上下文内注册的插件，不影响父级。
-    pub async fn stop(&mut self) -> Result<(), Error> {
+    async fn start_with(&mut self, serial: bool) -> Result<(), Error> {
+        if self.started || self.stopped {
+            return Ok(());
+        }
+
+        let order = self.compute_start_order()?;
+        self.started = true;
+
         let mut errors = Vec::new();
-
-        let (plugins, order) = {
-            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-            if inner.stopped {
-                return Ok(());
+        if serial {
+            for &index in &order {
+                self.started_plugins.push(index);
+                let record = &self.plugins[index];
+                if let Err(err) = record.plugin.start(&self.ctx).await {
+                    errors.push(err.into_phase(Phase::Start, Some(record.name())));
+                    break;
+                }
             }
-            inner.stopped = true;
-            let order = if inner.start_order.is_empty() {
-                (0..inner.plugins.len()).collect::<Vec<_>>()
-            } else {
-                inner.start_order.clone()
+        } else {
+            // 分层并行：拓扑同层无依赖边，可并发启动。
+            let layers = match compute_start_layers(&self.plugins, &order) {
+                Ok(layers) => layers,
+                Err(err) => {
+                    self.started = false;
+                    errors.push(err);
+                    return Err(Error::new(Phase::Start, ErrorKind::Multiple(errors)));
+                }
             };
-            (mem::take(&mut inner.plugins), order)
-        };
 
-        for &index in order.iter().rev() {
-            if let Some(plugin) = plugins.get(index)
-                && let Err(err) = plugin.stop(self).await
-            {
-                errors.push(err);
+            for layer in layers {
+                self.started_plugins.extend(layer.iter().copied());
+                let layer_plugins: Vec<(usize, &dyn Plugin)> = layer
+                    .iter()
+                    .map(|&index| (index, self.plugins[index].plugin.as_ref()))
+                    .collect();
+                let ctx = &self.ctx;
+                let results = futures::future::join_all(
+                    layer_plugins.iter().map(|(_, plugin)| plugin.start(ctx)),
+                )
+                .await;
+
+                for ((index, _plugin), result) in layer_plugins.into_iter().zip(results) {
+                    if let Err(err) = result {
+                        errors.push(err.into_phase(Phase::Start, Some(self.plugins[index].name())));
+                    }
+                }
+
+                if !errors.is_empty() {
+                    break;
+                }
             }
         }
 
-        {
-            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-            inner.plugins = plugins;
-        }
-
-        let mut hooks = {
-            let inner = Arc::get_mut(&mut self.inner).ok_or(Error::ContextShared)?;
-            mem::take(&mut *inner.dispose_hooks.lock().unwrap())
-        };
-        for hook in &mut hooks {
-            if let Err(err) = hook.call(&mut *self).await {
-                errors.push(err);
+        if errors.is_empty() {
+            let ctx = self.ctx.clone();
+            for hook in &mut self.ready {
+                if let Err(err) = hook.call(&ctx).await {
+                    errors.push(err.into_phase(Phase::Ready, None));
+                    break;
+                }
             }
         }
 
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(Error::Multiple(errors))
+            Err(Error::new(Phase::Start, ErrorKind::Multiple(errors)))
+        }
+    }
+
+    /// 默认分层并行启动。
+    pub async fn start(&mut self) -> Result<(), Error> {
+        self.start_with(false).await
+    }
+
+    /// 保留旧语义的串行启动。
+    pub async fn start_serial(&mut self) -> Result<(), Error> {
+        self.start_with(true).await
+    }
+
+    fn compute_start_order(&self) -> Result<Vec<usize>, Error> {
+        compute_start_order(&self.plugins, &self.ctx.inner.plugin_names, |name| {
+            self.ctx.inner.has_plugin(name)
+        })
+    }
+
+    /// 异步停止。
+    ///
+    /// 父/自身 `Runtime::stop` 只接受本层没有活跃子 Runtime；若仍有活跃子，
+    /// 返回 `ActiveScopes`，且不进入停止状态。
+    pub async fn stop(&mut self) -> Result<(), Error> {
+        if self.stopped {
+            return Ok(());
+        }
+
+        match self
+            .ctx
+            .inner
+            .state
+            .compare_exchange(0, STOPPED, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => self.stopped = true,
+            Err(s) => {
+                return Err(Error::new(
+                    Phase::Stop,
+                    ErrorKind::ActiveScopes {
+                        count: s & COUNT_MASK,
+                    },
+                ));
+            }
+        }
+
+        let mut errors = Vec::new();
+
+        let order = if self.started {
+            std::mem::take(&mut self.started_plugins)
+        } else {
+            // 未开始启动时，stop 不调用插件自身 stop；只执行 dispose hooks。
+            Vec::new()
+        };
+
+        for &index in order.iter().rev() {
+            let record = &self.plugins[index];
+            if let Err(err) = record.plugin.stop(&self.ctx).await {
+                errors.push(err.into_phase(Phase::Stop, Some(record.name())));
+            }
+        }
+
+        let ctx = self.ctx.clone();
+        for hook in &mut self.dispose {
+            if let Err(err) = hook.call(&ctx).await {
+                errors.push(err.into_phase(Phase::Dispose, None));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::new(Phase::Stop, ErrorKind::Multiple(errors)))
         }
     }
 }
 
-impl Default for Context {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// 子上下文。
-///
-/// 它是共享父级服务的局部 `Context`，用于隔离插件组。
-#[derive(Clone)]
-pub struct Scope {
-    ctx: Context,
-}
-
-impl Scope {
-    /// 创建孙级 Scope。
-    pub fn scope(&self) -> Scope {
-        self.ctx.scope()
-    }
-
-    /// 注册插件。
-    pub fn plugin<P: Plugin>(&mut self, plugin: P) -> Result<(), Error> {
-        self.ctx.plugin(plugin)
-    }
-
-    /// 批量注册插件。
-    pub fn plugins<I, P>(&mut self, plugins: I) -> Result<(), Error>
-    where
-        I: IntoIterator<Item = P>,
-        P: Plugin,
-    {
-        self.ctx.plugins(plugins)
-    }
-
-    /// 注册插件并注入配置。
-    pub fn plugin_with_config<P, C>(&mut self, plugin: P, config: C) -> Result<(), Error>
-    where
-        P: Plugin,
-        C: Send + Sync + 'static,
-    {
-        self.ctx.plugin_with_config(plugin, config)
-    }
-
-    /// 注册局部服务。
-    pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
-        self.ctx.provide(value)
-    }
-
-    /// 注册懒加载服务工厂。
-    pub fn provide_factory<T: Send + Sync + 'static>(
-        &mut self,
-        factory: impl Fn() -> Result<T, Error> + Send + Sync + 'static,
-    ) -> Result<(), Error> {
-        self.ctx.provide_factory(factory)
-    }
-
-    /// 注册集合服务实现。
-    pub fn provide_collect<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
-        self.ctx.provide_collect(value)
-    }
-
-    /// 尝试获取服务（含父级）。
-    pub fn try_require<T: Send + Sync + 'static>(&self) -> Result<Option<&T>, Error> {
-        self.ctx.try_require()
-    }
-
-    /// 获取 Scope 局部集合中的所有实现。
-    pub fn require_all<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
-        self.ctx.require_all()
-    }
-
-    /// 查询服务：局部优先，父级兜底。
-    pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
-        self.ctx.require()
-    }
-
-    /// 获取本地服务可变引用。
-    pub fn require_mut<T: Send + Sync + 'static>(&mut self) -> Result<&mut T, Error> {
-        self.ctx.require_mut()
-    }
-
-    /// 判断服务是否存在（局部 + 父级）。
-    pub fn contains<T: Send + Sync + 'static>(&self) -> bool {
-        self.ctx.contains::<T>()
-    }
-
-    /// 判断某个插件是否已注册（局部 + 父级）。
-    pub fn has_plugin(&self, name: &str) -> bool {
-        self.ctx.has_plugin(name)
-    }
-
-    /// 检查依赖。
-    pub fn verify_dependencies(&self) -> Result<(), Error> {
-        self.ctx.verify_dependencies()
-    }
-
-    /// 注册 ready 回调。
-    pub fn on_ready(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
-        self.ctx.on_ready(hook)
-    }
-
-    /// 注册 dispose 回调。
-    pub fn on_dispose(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
-        self.ctx.on_dispose(hook)
-    }
-
-    /// 注册事件 handler。
-    pub fn on<E, H>(&mut self, handler: H) -> Result<Subscription, Error>
-    where
-        E: Event,
-        H: EventHandler<E>,
-    {
-        self.ctx.on(handler)
-    }
-
-    /// 取消事件订阅。
-    pub fn off(&mut self, subscription: Subscription) -> Result<(), Error> {
-        self.ctx.off(subscription)
-    }
-
-    /// 串行发出事件。
-    pub async fn emit<E: Event>(&self, event: E) -> Result<(), Error> {
-        self.ctx.emit(event).await
-    }
-
-    /// 并发发出事件。
-    pub async fn emit_parallel<E: Event>(&self, event: E) -> Result<(), Error> {
-        self.ctx.emit_parallel(event).await
-    }
-
-    /// 异步启动 scope。
-    pub async fn start(&mut self) -> Result<(), Error> {
-        self.ctx.start().await
-    }
-
-    /// 异步停止 scope。
-    pub async fn stop(&mut self) -> Result<(), Error> {
-        self.ctx.stop().await
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        // 不做异步清理。租约释放由最后一个字段 `ScopeLease` 在字段析构阶段完成。
     }
 }

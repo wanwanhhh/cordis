@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use cordis::{Context, Error, Plugin, SyncHook};
+use cordis::{Builder, Configurator, Error, Plugin, SyncHook};
 
 #[derive(Default)]
 struct Logger {
@@ -10,12 +10,12 @@ struct LoggerPlugin;
 
 #[async_trait]
 impl Plugin for LoggerPlugin {
-    fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
-        ctx.provide(Logger {
+    fn apply(&self, cfg: &mut Configurator<'_>) -> Result<(), Error> {
+        cfg.provide(Logger {
             name: "basic".to_string(),
         })?;
 
-        ctx.on_ready(SyncHook(|ctx: &mut Context| {
+        cfg.on_ready(SyncHook(|ctx: &cordis::Context| {
             let logger = ctx.require::<Logger>()?;
             println!("ready, logger.name = {}", logger.name);
             Ok(())
@@ -27,11 +27,12 @@ impl Plugin for LoggerPlugin {
 
 fn main() -> Result<(), Error> {
     futures::executor::block_on(async {
-        let mut ctx = Context::new();
+        let mut builder = Builder::new();
 
-        ctx.plugin(LoggerPlugin)?;
-        ctx.start().await?;
-        ctx.stop().await?;
+        builder.plugin(LoggerPlugin)?;
+        let mut rt = builder.build()?;
+        rt.start().await?;
+        rt.stop().await?;
 
         Ok(())
     })

@@ -4,7 +4,7 @@ use std::any::TypeId;
 
 use async_trait::async_trait;
 
-use crate::{Context, Error};
+use crate::{Configurator, Context, Error};
 
 /// 服务依赖声明。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,23 +77,30 @@ pub trait Plugin: Send + Sync + 'static {
         "0.0.0"
     }
 
-    /// 插件优先级；越大越先启动。
+    /// 插件优先级；同一层内的调度提示。
     fn priority(&self) -> i32 {
         0
     }
 
     /// 插件声明的服务依赖。
-    fn dependencies(&self) -> &'static [Dependency] {
-        &[]
+    ///
+    /// 返回 `Vec`，由 `Builder::plugin()` 在注册时求值并缓存。
+    fn dependencies(&self) -> Vec<Dependency> {
+        Vec::new()
     }
 
     /// 插件声明的插件间依赖。
-    fn plugin_dependencies(&self) -> &'static [PluginDependency] {
-        &[]
+    ///
+    /// 返回 `Vec`，由 `Builder::plugin()` 在注册时求值并缓存。
+    fn plugin_dependencies(&self) -> Vec<PluginDependency> {
+        Vec::new()
     }
 
     /// 装载阶段。
-    fn apply(&self, _ctx: &mut Context) -> Result<(), Error> {
+    ///
+    /// 入参为窄接口 `Configurator`：可以注册服务/插件/hook，但不能修改运行期
+    /// 已冻结的既有服务，也不能调用 `start`/`stop`。
+    fn apply(&self, _cfg: &mut Configurator<'_>) -> Result<(), Error> {
         Ok(())
     }
 
@@ -103,7 +110,7 @@ pub trait Plugin: Send + Sync + 'static {
     }
 
     /// 销毁阶段。
-    async fn stop(&self, _ctx: &mut Context) -> Result<(), Error> {
+    async fn stop(&self, _ctx: &Context) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -112,9 +119,9 @@ pub trait Plugin: Send + Sync + 'static {
 #[async_trait]
 impl<F> Plugin for F
 where
-    F: Fn(&mut Context) -> Result<(), Error> + Send + Sync + 'static,
+    F: Fn(&mut Configurator<'_>) -> Result<(), Error> + Send + Sync + 'static,
 {
-    fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
-        self(ctx)
+    fn apply(&self, cfg: &mut Configurator<'_>) -> Result<(), Error> {
+        self(cfg)
     }
 }

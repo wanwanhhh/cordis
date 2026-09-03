@@ -4,7 +4,7 @@ use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use crate::Error;
+use crate::{Error, ErrorKind, Phase};
 
 /// 存储的服务实例。
 struct StoredService {
@@ -71,8 +71,9 @@ impl ServiceRegistry {
     pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
         let key = TypeId::of::<T>();
         if self.services.contains_key(&key) || self.factories.contains_key(&key) {
-            return Err(Error::ServiceAlreadyRegistered(
-                std::any::type_name::<T>().to_string(),
+            return Err(Error::new(
+                Phase::Build,
+                ErrorKind::ServiceAlreadyRegistered(std::any::type_name::<T>().to_string()),
             ));
         }
         self.services.insert(
@@ -92,8 +93,9 @@ impl ServiceRegistry {
     ) -> Result<(), Error> {
         let key = TypeId::of::<T>();
         if self.services.contains_key(&key) || self.factories.contains_key(&key) {
-            return Err(Error::ServiceAlreadyRegistered(
-                std::any::type_name::<T>().to_string(),
+            return Err(Error::new(
+                Phase::Build,
+                ErrorKind::ServiceAlreadyRegistered(std::any::type_name::<T>().to_string()),
             ));
         }
         self.factories.insert(
@@ -120,28 +122,36 @@ impl ServiceRegistry {
         let key = TypeId::of::<T>();
 
         if let Some(service) = self.services.get(&key) {
-            return service
-                .value
-                .downcast_ref::<T>()
-                .ok_or_else(|| Error::ServiceTypeMismatch {
-                    expected: std::any::type_name::<T>(),
-                    found: service.type_name,
-                });
+            return service.value.downcast_ref::<T>().ok_or_else(|| {
+                Error::new(
+                    Phase::Build,
+                    ErrorKind::ServiceTypeMismatch {
+                        expected: std::any::type_name::<T>(),
+                        found: service.type_name,
+                    },
+                )
+            });
         }
 
         if let Some(factory) = self.factories.get(&key) {
             return factory
                 .as_any()
                 .downcast_ref::<TypedFactory<T>>()
-                .ok_or_else(|| Error::ServiceTypeMismatch {
-                    expected: std::any::type_name::<T>(),
-                    found: std::any::type_name::<T>(),
+                .ok_or_else(|| {
+                    Error::new(
+                        Phase::Build,
+                        ErrorKind::ServiceTypeMismatch {
+                            expected: std::any::type_name::<T>(),
+                            found: std::any::type_name::<T>(),
+                        },
+                    )
                 })?
                 .get();
         }
 
-        Err(Error::ServiceNotFound(
-            std::any::type_name::<T>().to_string(),
+        Err(Error::new(
+            Phase::Build,
+            ErrorKind::ServiceNotFound(std::any::type_name::<T>().to_string()),
         ))
     }
 
@@ -149,7 +159,10 @@ impl ServiceRegistry {
     pub fn try_get<T: Send + Sync + 'static>(&self) -> Result<Option<&T>, Error> {
         match self.get::<T>() {
             Ok(value) => Ok(Some(value)),
-            Err(Error::ServiceNotFound(_)) => Ok(None),
+            Err(Error {
+                kind: ErrorKind::ServiceNotFound(_),
+                ..
+            }) => Ok(None),
             Err(err) => Err(err),
         }
     }
@@ -159,13 +172,15 @@ impl ServiceRegistry {
         let mut result = Vec::new();
         if let Some(values) = self.collections.get(&TypeId::of::<T>()) {
             for value in values {
-                let value =
-                    value
-                        .downcast_ref::<T>()
-                        .ok_or_else(|| Error::ServiceTypeMismatch {
+                let value = value.downcast_ref::<T>().ok_or_else(|| {
+                    Error::new(
+                        Phase::Build,
+                        ErrorKind::ServiceTypeMismatch {
                             expected: std::any::type_name::<T>(),
                             found: std::any::type_name::<T>(),
-                        })?;
+                        },
+                    )
+                })?;
                 result.push(value);
             }
         }
@@ -177,28 +192,36 @@ impl ServiceRegistry {
         let key = TypeId::of::<T>();
 
         if let Some(service) = self.services.get_mut(&key) {
-            return service
-                .value
-                .downcast_mut::<T>()
-                .ok_or_else(|| Error::ServiceTypeMismatch {
-                    expected: std::any::type_name::<T>(),
-                    found: service.type_name,
-                });
+            return service.value.downcast_mut::<T>().ok_or_else(|| {
+                Error::new(
+                    Phase::Build,
+                    ErrorKind::ServiceTypeMismatch {
+                        expected: std::any::type_name::<T>(),
+                        found: service.type_name,
+                    },
+                )
+            });
         }
 
         if let Some(factory) = self.factories.get_mut(&key) {
             return factory
                 .as_any_mut()
                 .downcast_mut::<TypedFactory<T>>()
-                .ok_or_else(|| Error::ServiceTypeMismatch {
-                    expected: std::any::type_name::<T>(),
-                    found: std::any::type_name::<T>(),
+                .ok_or_else(|| {
+                    Error::new(
+                        Phase::Build,
+                        ErrorKind::ServiceTypeMismatch {
+                            expected: std::any::type_name::<T>(),
+                            found: std::any::type_name::<T>(),
+                        },
+                    )
                 })?
                 .get_mut();
         }
 
-        Err(Error::ServiceNotFound(
-            std::any::type_name::<T>().to_string(),
+        Err(Error::new(
+            Phase::Build,
+            ErrorKind::ServiceNotFound(std::any::type_name::<T>().to_string()),
         ))
     }
 
@@ -218,18 +241,25 @@ impl ServiceRegistry {
     /// 移除普通服务。
     pub fn remove<T: Send + Sync + 'static>(&mut self) -> Result<T, Error> {
         let key = TypeId::of::<T>();
-        let service = self
-            .services
-            .remove(&key)
-            .ok_or_else(|| Error::ServiceNotFound(std::any::type_name::<T>().to_string()))?;
+        let service = self.services.remove(&key).ok_or_else(|| {
+            Error::new(
+                Phase::Build,
+                ErrorKind::ServiceNotFound(std::any::type_name::<T>().to_string()),
+            )
+        })?;
 
         service
             .value
             .downcast::<T>()
             .map(|value| *value)
-            .map_err(|_| Error::ServiceTypeMismatch {
-                expected: std::any::type_name::<T>(),
-                found: service.type_name,
+            .map_err(|_| {
+                Error::new(
+                    Phase::Build,
+                    ErrorKind::ServiceTypeMismatch {
+                        expected: std::any::type_name::<T>(),
+                        found: service.type_name,
+                    },
+                )
             })
     }
 

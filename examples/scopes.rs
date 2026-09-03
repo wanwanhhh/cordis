@@ -1,7 +1,5 @@
-use std::sync::OnceLock;
-
 use async_trait::async_trait;
-use cordis::{Context, Dependency, Error, Plugin};
+use cordis::{Builder, Configurator, Context, Dependency, Error, Plugin};
 
 struct Database;
 
@@ -16,8 +14,8 @@ struct RootPlugin;
 
 #[async_trait]
 impl Plugin for RootPlugin {
-    fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
-        ctx.provide(Database)?;
+    fn apply(&self, cfg: &mut Configurator<'_>) -> Result<(), Error> {
+        cfg.provide(Database)?;
         Ok(())
     }
 }
@@ -28,16 +26,14 @@ struct SessionPlugin;
 
 #[async_trait]
 impl Plugin for SessionPlugin {
-    fn dependencies(&self) -> &'static [Dependency] {
-        static DEPS: OnceLock<Dependency> = OnceLock::new();
-        let dependency = DEPS.get_or_init(Dependency::of::<Database>);
-        std::slice::from_ref(dependency)
+    fn dependencies(&self) -> Vec<Dependency> {
+        vec![Dependency::of::<Database>()]
     }
 
-    fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
-        let db = ctx.require::<Database>()?;
+    fn apply(&self, cfg: &mut Configurator<'_>) -> Result<(), Error> {
+        let db = cfg.require::<Database>()?;
         db.query("create session");
-        ctx.provide(SessionService)?;
+        cfg.provide(SessionService)?;
         Ok(())
     }
 }
@@ -48,50 +44,51 @@ struct SubflowPlugin;
 
 #[async_trait]
 impl Plugin for SubflowPlugin {
-    fn dependencies(&self) -> &'static [Dependency] {
-        static DEPS: OnceLock<[Dependency; 2]> = OnceLock::new();
-        let deps = DEPS.get_or_init(|| {
-            [
-                Dependency::of::<Database>(),
-                Dependency::of::<SessionService>(),
-            ]
-        });
-        &deps[..]
+    fn dependencies(&self) -> Vec<Dependency> {
+        vec![
+            Dependency::of::<Database>(),
+            Dependency::of::<SessionService>(),
+        ]
     }
 
-    fn apply(&self, ctx: &mut Context) -> Result<(), Error> {
-        let db = ctx.require::<Database>()?;
-        let _session = ctx.require::<SessionService>()?;
+    fn apply(&self, cfg: &mut Configurator<'_>) -> Result<(), Error> {
+        let db = cfg.require::<Database>()?;
+        let _session = cfg.require::<SessionService>()?;
         db.query("start subflow");
-        ctx.provide(SubflowService)?;
+        cfg.provide(SubflowService)?;
         Ok(())
     }
 }
 
 fn main() -> Result<(), Error> {
     futures::executor::block_on(async {
-        let mut ctx = Context::new();
-        ctx.plugin(RootPlugin)?;
-        ctx.start().await?;
+        let mut builder = Builder::new();
+        builder.plugin(RootPlugin)?;
+        let mut rt = builder.build()?;
+        rt.start().await?;
 
-        let mut session = ctx.scope();
+        let ctx: Context = rt.handle();
+        let mut session = ctx.scope()?;
         session.plugin(SessionPlugin)?;
-        session.start().await?;
+        let mut session_rt = session.build()?;
+        session_rt.start().await?;
 
-        let mut subflow = session.scope();
+        let session_ctx = session_rt.handle();
+        let mut subflow = session_ctx.scope()?;
         subflow.plugin(SubflowPlugin)?;
 
         assert!(subflow.contains::<Database>());
         assert!(subflow.contains::<SessionService>());
 
-        subflow.start().await?;
-        subflow.stop().await?;
-        drop(subflow);
+        let mut subflow_rt = subflow.build()?;
+        subflow_rt.start().await?;
+        subflow_rt.stop().await?;
+        drop(subflow_rt);
 
-        session.stop().await?;
-        drop(session);
+        session_rt.stop().await?;
+        drop(session_rt);
 
-        ctx.stop().await?;
+        rt.stop().await?;
 
         Ok(())
     })
