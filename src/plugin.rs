@@ -64,6 +64,17 @@ impl PluginDependency {
     }
 }
 
+/// 插件允许安装的作用域。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PluginScope {
+    /// 只能装在根 Builder / Root Context。
+    Root,
+    /// 只能装在任意非根 Builder / Child Context（包括嵌套子作用域）。
+    Child,
+    /// 根和子作用域都允许（默认）。
+    Any,
+}
+
 /// 插件 trait。
 #[async_trait]
 pub trait Plugin: Send + Sync + 'static {
@@ -80,6 +91,13 @@ pub trait Plugin: Send + Sync + 'static {
     /// 插件优先级；同一层内的调度提示。
     fn priority(&self) -> i32 {
         0
+    }
+
+    /// 插件允许安装的作用域。
+    ///
+    /// 默认允许安装在根和子作用域。框架会在 `Builder::plugin()` 注册阶段校验。
+    fn scope(&self) -> PluginScope {
+        PluginScope::Any
     }
 
     /// 插件声明的服务依赖。

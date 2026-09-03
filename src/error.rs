@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::plugin::PluginScope;
+
 /// 错误发生阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -33,6 +35,12 @@ pub enum ErrorKind {
     PluginDependencyNotFound(String),
     /// 插件依赖存在循环。
     PluginDependencyCycle,
+    /// 插件安装作用域不匹配。
+    PluginScopeMismatch {
+        plugin_name: String,
+        expected: PluginScope,
+        actual: PluginScope,
+    },
     /// 父 Runtime 停止时仍有活跃子 Runtime。
     ActiveScopes { count: u64 },
     /// 父已进入停止，拒绝新 scope。
@@ -151,6 +159,17 @@ impl fmt::Display for Error {
             }
             ErrorKind::PluginDependencyCycle => {
                 write!(f, "{:?}: plugin dependency cycle detected", self.phase)
+            }
+            ErrorKind::PluginScopeMismatch {
+                plugin_name,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "{:?}: plugin scope mismatch for {plugin_name}: expected {expected:?}, actual {actual:?}",
+                    self.phase
+                )
             }
             ErrorKind::ActiveScopes { count } => {
                 write!(f, "{:?}: active scopes: {count}", self.phase)

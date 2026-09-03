@@ -2,7 +2,8 @@
 
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::{Error, ErrorKind, Phase};
 
@@ -50,6 +51,51 @@ impl<T: Send + Sync + 'static> ErasedFactory for TypedFactory<T> {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+/// 运行时动态配置值。
+///
+/// 以普通服务的形式注册为 `Arc<DynamicValue<T>>`，运行期可通过只读 `Context`
+/// 取得同一个 `Arc` 句柄，在保持服务注册表冻结语义的同时安全地修改配置。
+pub struct DynamicValue<T> {
+    value: Arc<RwLock<T>>,
+}
+
+impl<T> DynamicValue<T> {
+    /// 创建动态配置值。
+    pub fn new(initial: T) -> Self {
+        Self {
+            value: Arc::new(RwLock::new(initial)),
+        }
+    }
+
+    /// 读取当前配置值。
+    ///
+    /// 如果内部的 `RwLock` 已被写线程 panic 污染，会直接 panic。
+    pub fn read(&self) -> impl Deref<Target = T> + '_ {
+        self.value.read().expect("dynamic value poisoned")
+    }
+
+    /// 获取当前配置值的可变写锁。
+    ///
+    /// 如果内部的 `RwLock` 已被写线程 panic 污染，会直接 panic。
+    pub fn write(&self) -> impl DerefMut<Target = T> + '_ {
+        self.value.write().expect("dynamic value poisoned")
+    }
+
+    /// 整体替换配置值。
+    ///
+    /// 如果内部的 `RwLock` 已被写线程 panic 污染，会直接 panic。
+    pub fn set(&self, value: T) {
+        *self.value.write().expect("dynamic value poisoned") = value;
+    }
+
+    /// 通过闭包更新配置值。
+    ///
+    /// 如果内部的 `RwLock` 已被写线程 panic 污染，会直接 panic。
+    pub fn update(&self, f: impl FnOnce(&mut T)) {
+        f(&mut self.value.write().expect("dynamic value poisoned"));
     }
 }
 

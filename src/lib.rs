@@ -49,8 +49,8 @@ pub use error::{Error, ErrorKind, Phase};
 pub use event::{
     AsyncFnEventHandler, Event, EventControl, EventHandler, FnEventHandler, Subscription,
 };
-pub use plugin::{Dependency, Plugin, PluginDependency};
-pub use service::ServiceRegistry;
+pub use plugin::{Dependency, Plugin, PluginDependency, PluginScope};
+pub use service::{DynamicValue, ServiceRegistry};
 
 #[cfg(test)]
 mod tests {
@@ -1731,5 +1731,289 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn plugin_scope_enforces_root_and_child_restrictions() {
+        struct RootOnly;
+
+        impl Plugin for RootOnly {
+            fn name(&self) -> &'static str {
+                "root-only"
+            }
+
+            fn scope(&self) -> PluginScope {
+                PluginScope::Root
+            }
+        }
+
+        struct ChildOnly;
+
+        impl Plugin for ChildOnly {
+            fn name(&self) -> &'static str {
+                "child-only"
+            }
+
+            fn scope(&self) -> PluginScope {
+                PluginScope::Child
+            }
+        }
+
+        let mut builder = Builder::new();
+        builder.plugin(RootOnly).unwrap();
+
+        let err = builder.plugin(ChildOnly).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ErrorKind::PluginScopeMismatch {
+                plugin_name,
+                expected: PluginScope::Child,
+                actual: PluginScope::Root,
+            } if plugin_name == "child-only"
+        ));
+
+        let rt = builder.build().unwrap();
+        let ctx = rt.handle();
+        let mut child = ctx.scope().unwrap();
+        child.plugin(ChildOnly).unwrap();
+
+        let err = child.plugin(RootOnly).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ErrorKind::PluginScopeMismatch {
+                plugin_name,
+                expected: PluginScope::Root,
+                actual: PluginScope::Child,
+            } if plugin_name == "root-only"
+        ));
+    }
+
+    #[test]
+    fn require_all_recursive_inherits_parent_collections() {
+        struct Tool(&'static str);
+
+        let mut builder = Builder::new();
+        builder.provide_collect(Tool("root")).unwrap();
+        let rt = builder.build().unwrap();
+        let ctx = rt.handle();
+
+        let mut child = ctx.scope().unwrap();
+        child.provide_collect(Tool("child-1")).unwrap();
+        child.provide_collect(Tool("child-2")).unwrap();
+        let child_rt = child.build().unwrap();
+        let child_ctx = child_rt.handle();
+
+        let local = child_ctx.require_all::<Tool>().unwrap();
+        assert_eq!(local.len(), 2);
+        assert_eq!(local[0].0, "child-1");
+        assert_eq!(local[1].0, "child-2");
+
+        let recursive = child_ctx.require_all_recursive::<Tool>().unwrap();
+        let names: Vec<&str> = recursive.iter().map(|tool| tool.0).collect();
+        assert_eq!(names, ["child-1", "child-2", "root"]);
+
+        drop(child_rt);
+        drop(rt);
+    }
+
+    #[test]
+    fn emit_notify_continues_after_handler_errors() {
+        struct Notify;
+
+        let mut builder = Builder::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let root_seen = observed.clone();
+        builder
+            .on::<Notify, _>(FnEventHandler(move |_: &Notify, _: &Context| {
+                root_seen.lock().unwrap().push("root");
+                Err(Error::new(Phase::Event, ErrorKind::Other))
+            }))
+            .unwrap();
+
+        let rt = builder.build().unwrap();
+        let ctx = rt.handle();
+        let mut child = ctx.scope().unwrap();
+        let child_seen = observed.clone();
+        child
+            .on::<Notify, _>(FnEventHandler(move |_: &Notify, _: &Context| {
+                child_seen.lock().unwrap().push("child");
+                Err(Error::new(Phase::Event, ErrorKind::Other))
+            }))
+            .unwrap();
+        let child_rt = child.build().unwrap();
+        let child_ctx = child_rt.handle();
+
+        let errors = block_on(child_ctx.emit_notify(Notify));
+        assert_eq!(errors.len(), 2);
+
+        let mut seen = observed.lock().unwrap();
+        seen.sort_unstable();
+        assert_eq!(&*seen, &["child", "root"]);
+    }
+
+    #[test]
+    fn emit_notify_bail_stops_bubbling() {
+        struct NotifyBail;
+
+        let mut builder = Builder::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let root_seen = observed.clone();
+        builder
+            .on::<NotifyBail, _>(FnEventHandler(move |_: &NotifyBail, _: &Context| {
+                root_seen.lock().unwrap().push("root");
+                Ok(EventControl::Continue)
+            }))
+            .unwrap();
+
+        let rt = builder.build().unwrap();
+        let ctx = rt.handle();
+        let mut child = ctx.scope().unwrap();
+        let child_seen = observed.clone();
+        child
+            .on::<NotifyBail, _>(FnEventHandler(move |_: &NotifyBail, _: &Context| {
+                child_seen.lock().unwrap().push("child");
+                Ok(EventControl::Bail)
+            }))
+            .unwrap();
+        let child_rt = child.build().unwrap();
+        let child_ctx = child_rt.handle();
+
+        let errors = block_on(child_ctx.emit_notify(NotifyBail));
+        assert!(errors.is_empty());
+        let seen = observed.lock().unwrap();
+        assert_eq!(&*seen, &["child"]);
+    }
+
+    #[test]
+    fn emit_notify_parallel_continues_after_handler_errors() {
+        struct NotifyParallel;
+
+        let mut builder = Builder::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let root_seen = observed.clone();
+        builder
+            .on::<NotifyParallel, _>(FnEventHandler(move |_: &NotifyParallel, _: &Context| {
+                root_seen.lock().unwrap().push("root");
+                Err(Error::new(Phase::Event, ErrorKind::Other))
+            }))
+            .unwrap();
+
+        let rt = builder.build().unwrap();
+        let ctx = rt.handle();
+        let mut child = ctx.scope().unwrap();
+        let child_seen = observed.clone();
+        child
+            .on::<NotifyParallel, _>(FnEventHandler(move |_: &NotifyParallel, _: &Context| {
+                child_seen.lock().unwrap().push("child");
+                Err(Error::new(Phase::Event, ErrorKind::Other))
+            }))
+            .unwrap();
+        let child_rt = child.build().unwrap();
+        let child_ctx = child_rt.handle();
+
+        let errors = block_on(child_ctx.emit_notify_parallel(NotifyParallel));
+        assert_eq!(errors.len(), 2);
+
+        let mut seen = observed.lock().unwrap();
+        seen.sort_unstable();
+        assert_eq!(&*seen, &["child", "root"]);
+    }
+
+    #[test]
+    fn emit_notify_parallel_bail_stops_bubbling() {
+        struct NotifyParallelBail;
+
+        let mut builder = Builder::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let root_seen = observed.clone();
+        builder
+            .on::<NotifyParallelBail, _>(FnEventHandler(
+                move |_: &NotifyParallelBail, _: &Context| {
+                    root_seen.lock().unwrap().push("root");
+                    Ok(EventControl::Continue)
+                },
+            ))
+            .unwrap();
+
+        let rt = builder.build().unwrap();
+        let ctx = rt.handle();
+        let mut child = ctx.scope().unwrap();
+        let child_seen = observed.clone();
+        child
+            .on::<NotifyParallelBail, _>(FnEventHandler(
+                move |_: &NotifyParallelBail, _: &Context| {
+                    child_seen.lock().unwrap().push("child");
+                    Ok(EventControl::Bail)
+                },
+            ))
+            .unwrap();
+        let child_rt = child.build().unwrap();
+        let child_ctx = child_rt.handle();
+
+        let errors = block_on(child_ctx.emit_notify_parallel(NotifyParallelBail));
+        assert!(errors.is_empty());
+        let seen = observed.lock().unwrap();
+        assert_eq!(&*seen, &["child"]);
+    }
+
+    #[test]
+    fn builder_depth_and_is_root_for_nested_scopes() {
+        let root = Builder::new();
+        assert_eq!(root.depth(), 0);
+        assert!(root.is_root());
+
+        let rt = root.build().unwrap();
+        let ctx = rt.handle();
+        let child = ctx.scope().unwrap();
+        assert_eq!(child.depth(), 1);
+        assert!(!child.is_root());
+
+        let child_rt = child.build().unwrap();
+        let child_ctx = child_rt.handle();
+        let grandchild = child_ctx.scope().unwrap();
+        assert_eq!(grandchild.depth(), 2);
+        assert!(!grandchild.is_root());
+    }
+
+    #[test]
+    fn dynamic_value_can_be_updated_at_runtime() {
+        let mut builder = Builder::new();
+        builder.provide_dynamic(1_u32).unwrap();
+
+        // 动态配置不占用原 T 的类型槽位。
+        assert!(!builder.contains::<u32>());
+        assert!(builder.contains::<Arc<DynamicValue<u32>>>());
+
+        let rt = builder.build().unwrap();
+        let ctx = rt.handle();
+        let dynamic = ctx.require_dynamic::<u32>().unwrap();
+        assert_eq!(*dynamic.read(), 1);
+
+        dynamic.set(2);
+        assert_eq!(*dynamic.read(), 2);
+
+        dynamic.update(|value| *value += 3);
+        assert_eq!(*dynamic.read(), 5);
+    }
+
+    #[test]
+    fn dynamic_value_is_inherited_by_child_scope() {
+        let mut builder = Builder::new();
+        builder.provide_dynamic("boot".to_string()).unwrap();
+        let rt = builder.build().unwrap();
+        let ctx = rt.handle();
+
+        let child = ctx.scope().unwrap();
+        let child_rt = child.build().unwrap();
+        let child_ctx = child_rt.handle();
+
+        let dynamic = child_ctx.require_dynamic::<String>().unwrap();
+        assert_eq!(*dynamic.read(), "boot");
+
+        dynamic.set("child-updated".to_string());
+        assert_eq!(
+            *ctx.require_dynamic::<String>().unwrap().read(),
+            "child-updated"
+        );
     }
 }

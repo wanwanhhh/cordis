@@ -144,6 +144,29 @@ impl Plugin for MyPlugin {
 }
 ```
 
+### 3.5 插件作用域
+
+默认插件可安装在根或子作用域。你可以限制插件安装位置：
+
+```rust
+use cordis::PluginScope;
+
+impl Plugin for RootOnlyPlugin {
+    fn scope(&self) -> PluginScope {
+        PluginScope::Root
+    }
+}
+
+impl Plugin for ChildOnlyPlugin {
+    fn scope(&self) -> PluginScope {
+        // 任意非根作用域，包括嵌套子作用域
+        PluginScope::Child
+    }
+}
+```
+
+作用域不匹配会在注册阶段返回 `ErrorKind::PluginScopeMismatch`。
+
 ---
 
 ## 4. 服务
@@ -173,7 +196,12 @@ builder.provide_collect(ClaudeProvider::new())?;
 let providers = ctx.require_all::<Arc<dyn LlmProvider>>()?;
 ```
 
-`require_all` 只返回当前层局部集合，不继承父级。
+`require_all` 只返回当前层局部集合，不继承父级。需要读取父级集合时使用 `require_all_recursive`：
+
+```rust
+let providers = ctx.require_all_recursive::<Arc<dyn LlmProvider>>()?;
+// 顺序：先当前层，再沿父链向上
+```
 
 ### 4.4 懒加载工厂
 
@@ -197,6 +225,23 @@ builder.provide_factory(|| Ok::<u32, Error>(0))?;
 ```
 
 `require_mut` 只存在于 `Builder`；运行 `build()` 之后不存在框架可见的 `&mut` 服务路径。
+
+### 4.6 运行时动态配置
+
+```rust
+builder.provide_dynamic(42_u32)?;
+
+let dynamic = ctx.require_dynamic::<u32>()?;
+assert_eq!(*dynamic.read(), 42);
+
+dynamic.set(7);
+dynamic.update(|value| *value += 1);
+assert_eq!(*dynamic.read(), 8);
+```
+
+`provide_dynamic` 实际注册的是 `Arc<DynamicValue<T>>`，不占用原始 `T` 的服务槽位；子作用域也能通过父链读取同一个动态配置句柄。
+
+> 注意：`DynamicValue` 底层使用 `RwLock`。如果写锁被 panic 污染，`read` / `write` / `set` / `update` 会直接 panic。
 
 ---
 
@@ -336,6 +381,19 @@ builder.off(sub)?;
 
 `EventControl::Bail` 会停止后续 handlers 和向上冒泡。
 
+### 7.7 旁路通知
+
+`emit_notify` 适合横切事件：handler 失败不阻断主流程，但错误不会静默吞掉：
+
+```rust
+let errors = ctx.emit_notify(ConfigChanged).await;
+for error in errors {
+    log::warn!("config event handler failed: {error}");
+}
+```
+
+`emit_notify_parallel` 是并行版本。`emit` / `emit_parallel` 保持原有严格错误传播语义。
+
 ---
 
 ## 8. 错误处理
@@ -367,6 +425,7 @@ ErrorKind::SubscriptionNotFound
 ErrorKind::PluginDependencyNotFound
 ErrorKind::PluginNameAlreadyRegistered
 ErrorKind::PluginDependencyCycle
+ErrorKind::PluginScopeMismatch { plugin_name, expected, actual }
 ErrorKind::ActiveScopes { count }
 ErrorKind::Stopping
 ErrorKind::TooManyScopes

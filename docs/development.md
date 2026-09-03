@@ -40,8 +40,8 @@ src/
    - 不用 `ManuallyDrop` 等绕开析构顺序的工具。
 
 5. **内部可变白名单**
-   - 只允许 `OnceLock`（懒工厂）与 `Data.state: AtomicU64`（scope 计数/停止位）。
-   - 不允许在 `Data` 放 `Mutex<Vec<...>>` 作为通用可变通道。
+   - 只允许 `OnceLock`（懒工厂）、`Data.state: AtomicU64`（scope 计数/停止位）与 `DynamicValue` 服务内部的 `RwLock`。
+   - 不允许在 `Data` 本身放 `Mutex<Vec<...>>` 作为通用可变通道；运行期可变配置必须通过 `DynamicValue` 暴露。
 
 6. **租约字段序**
    - `ScopeLease` 必须是 `Runtime` 最后一个声明字段。

@@ -23,7 +23,7 @@ Builder::build()          // 唯一冻结点：Arc::new(Data)
 Runtime                   // start / stop / handle()
    │
    ▼
-Context                   // require / contains / has_plugin / emit / scope
+Context                   // require / require_all_recursive / contains / has_plugin / emit / emit_notify / scope
 ```
 
 冻结点之后不存在任何框架可见的 `&mut Data` 路径。`Context` 只读且可跨线程共享。
@@ -85,9 +85,10 @@ let child: Builder = ctx.scope()?;
 ## 4. 服务
 
 - `ServiceRegistry` 支持普通服务、懒加载工厂、集合服务。
-- `Builder` 阶段可 `provide` / `provide_factory` / `provide_collect` / `require_mut`。
-- `Context` 阶段只读：`require` / `try_require` / `require_all` / `contains`。
-- `require_all` 只查本层，不沿父链冒泡。
+- `Builder` 阶段可 `provide` / `provide_factory` / `provide_collect` / `provide_dynamic` / `require_mut`。
+- `Context` 阶段只读：`require` / `try_require` / `require_all` / `require_all_recursive` / `require_dynamic` / `contains`。
+- `require_all` 只查本层，不沿父链冒泡；`require_all_recursive` 会依次汇总本层和所有父层集合。
+- `provide_dynamic` 注册的是 `Arc<DynamicValue<T>>`，运行期可通过 `require_dynamic` 获得共享句柄并修改内部值。
 - 懒工厂使用裸 `OnceLock`：并发首次访问不保证工厂只执行一次，但成功实例只缓存一个。
 
 ---
@@ -102,6 +103,7 @@ pub trait Plugin: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn version(&self) -> &'static str;
     fn priority(&self) -> i32;
+    fn scope(&self) -> PluginScope;
     fn dependencies(&self) -> Vec<Dependency>;
     fn plugin_dependencies(&self) -> Vec<PluginDependency>;
     fn apply(&self, cfg: &mut Configurator<'_>) -> Result<(), Error>;
@@ -110,6 +112,7 @@ pub trait Plugin: Send + Sync + 'static {
 }
 ```
 
+- `scope` 默认 `Any`，在 `Builder::plugin()` 注册阶段校验；`Root` / `Child` 插件装在错误层级返回 `PluginScopeMismatch`。
 - `dependencies` / `plugin_dependencies` 在注册时求值并缓存进 `PluginRecord`。
 - `apply` 收到窄接口 `Configurator`，不能修改既有服务，也不能执行 start/stop/emit/scope。
 - `start` / `stop` 只收 `&Context`，生命周期方法不存在框架级可变别名。
@@ -150,10 +153,11 @@ pub trait Plugin: Send + Sync + 'static {
 ## 7. 事件系统
 
 - 注册在 `Builder` 阶段：`on::<E, _>(handler)`。
-- 触发在 `Context` 阶段：`ctx.emit(event)` / `ctx.emit_parallel(event)`。
+- 触发在 `Context` 阶段：`ctx.emit(event)` / `ctx.emit_parallel(event)` / `ctx.emit_notify(event)` / `ctx.emit_notify_parallel(event)`。
 - 事件沿父链冒泡。
 - handler 收到的是其注册层级的 `Context`。
 - `emit_parallel` 错误聚合使用 `Phase::Event` + `ErrorKind::Multiple`。
+- `emit_notify` / `emit_notify_parallel` 不抛错，而是返回收集到的 handler 错误；handler 错误不阻断后续 handler 与父链冒泡，但 `Bail` 仍会停止冒泡。
 
 ---
 
@@ -183,6 +187,11 @@ pub enum ErrorKind {
     PluginNameAlreadyRegistered(String),
     PluginDependencyNotFound(String),
     PluginDependencyCycle,
+    PluginScopeMismatch {
+        plugin_name: String,
+        expected: PluginScope,
+        actual: PluginScope,
+    },
     ActiveScopes { count: u64 },
     Stopping,
     TooManyScopes,

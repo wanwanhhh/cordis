@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use async_trait::async_trait;
 
 use crate::event::{ErasedEventHandler, Subscription, TypedEventHandler};
-use crate::{Error, ErrorKind, Event, EventControl, EventHandler, Phase, Plugin, ServiceRegistry};
+use crate::{
+    DynamicValue, Error, ErrorKind, Event, EventControl, EventHandler, Phase, Plugin, PluginScope,
+    ServiceRegistry,
+};
 
 static NEXT_CONTEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -121,6 +124,14 @@ impl Data {
 
     fn all<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
         self.services.all()
+    }
+
+    fn all_with_parents<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
+        let mut values = self.services.all::<T>()?;
+        if let Some(parent) = &self.parent {
+            values.extend(parent.all_with_parents::<T>()?);
+        }
+        Ok(values)
     }
 
     fn contains<T: Send + Sync + 'static>(&self) -> bool {
@@ -337,6 +348,24 @@ impl Builder {
         }
     }
 
+    /// 当前 Builder 在作用域树中的深度；根 Builder 为 0。
+    ///
+    /// 该方法是公开的辅助查询接口，可与 [`Builder::is_root`] 配合使用。
+    pub fn depth(&self) -> usize {
+        let mut depth = 0;
+        let mut current = &self.data;
+        while let Some(parent) = &current.parent {
+            depth += 1;
+            current = parent.as_ref();
+        }
+        depth
+    }
+
+    /// 当前 Builder 是否为根 Builder。
+    pub fn is_root(&self) -> bool {
+        self.data.parent.is_none()
+    }
+
     fn snapshot(&self) -> Snapshot {
         (
             self.data.services.type_ids(),
@@ -374,6 +403,24 @@ impl Builder {
     /// 会回滚到进入 `apply` 之前的状态。
     pub fn plugin<P: Plugin>(&mut self, plugin: P) -> Result<(), Error> {
         let name = plugin.name();
+        let declared_scope = plugin.scope();
+        let actual_scope = if self.is_root() {
+            PluginScope::Root
+        } else {
+            PluginScope::Child
+        };
+
+        if declared_scope != PluginScope::Any && declared_scope != actual_scope {
+            return Err(Error::new(
+                Phase::Build,
+                ErrorKind::PluginScopeMismatch {
+                    plugin_name: name.to_string(),
+                    expected: declared_scope,
+                    actual: actual_scope,
+                },
+            ));
+        }
+
         let deps = plugin.dependencies();
         let plugin_deps = plugin.plugin_dependencies();
 
@@ -455,6 +502,19 @@ impl Builder {
         self.data.services.provide_collect(value)
     }
 
+    /// 注册一个运行时动态配置服务。
+    ///
+    /// 实际服务类型为 `Arc<DynamicValue<T>>`，不会占用原 `T` 的类型槽位。
+    pub fn provide_dynamic<T: Send + Sync + 'static>(&mut self, initial: T) -> Result<(), Error> {
+        let value = Arc::new(DynamicValue::new(initial));
+        self.provide(value)
+    }
+
+    /// 获取运行时动态配置服务的共享句柄。
+    pub fn require_dynamic<T: Send + Sync + 'static>(&self) -> Result<Arc<DynamicValue<T>>, Error> {
+        self.require::<Arc<DynamicValue<T>>>().map(Arc::clone)
+    }
+
     /// 尝试获取服务（普通服务或工厂，含父级）。
     pub fn try_require<T: Send + Sync + 'static>(&self) -> Result<Option<&T>, Error> {
         self.data.try_require()
@@ -463,6 +523,11 @@ impl Builder {
     /// 获取本层局部集合中的所有实现。
     pub fn require_all<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
         self.data.all()
+    }
+
+    /// 获取本层及所有父层集合中的所有实现；先本层，再沿父链向上。
+    pub fn require_all_recursive<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
+        self.data.all_with_parents()
     }
 
     /// 获取服务引用。
@@ -635,6 +700,16 @@ impl Configurator<'_> {
         self.builder.require_all()
     }
 
+    /// 获取本层及所有父层集合中的所有实现；先本层，再沿父链向上。
+    pub fn require_all_recursive<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
+        self.builder.require_all_recursive()
+    }
+
+    /// 获取运行时动态配置服务的共享句柄。
+    pub fn require_dynamic<T: Send + Sync + 'static>(&self) -> Result<Arc<DynamicValue<T>>, Error> {
+        self.builder.require_dynamic()
+    }
+
     /// 获取服务引用。
     pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
         self.builder.require()
@@ -666,6 +741,11 @@ impl Configurator<'_> {
     /// 注册一个集合服务实现。
     pub fn provide_collect<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
         self.builder.provide_collect(value)
+    }
+
+    /// 注册一个运行时动态配置服务。
+    pub fn provide_dynamic<T: Send + Sync + 'static>(&mut self, initial: T) -> Result<(), Error> {
+        self.builder.provide_dynamic(initial)
     }
 
     /// 注册子插件。
@@ -763,6 +843,16 @@ impl Context {
         self.inner.all()
     }
 
+    /// 获取当前 Context 及所有父层集合中的所有实现；先本层，再沿父链向上。
+    pub fn require_all_recursive<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
+        self.inner.all_with_parents()
+    }
+
+    /// 获取运行时动态配置服务的共享句柄。
+    pub fn require_dynamic<T: Send + Sync + 'static>(&self) -> Result<Arc<DynamicValue<T>>, Error> {
+        self.require::<Arc<DynamicValue<T>>>().map(Arc::clone)
+    }
+
     /// 获取服务引用。
     pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
         self.inner.require()
@@ -786,16 +876,44 @@ impl Context {
 
     /// 串行发出事件，并沿父链向上冒泡。
     pub async fn emit<E: Event>(&self, event: E) -> Result<(), Error> {
-        self.emit_impl(event, false).await
+        let errors = self.emit_impl(event, false, false).await;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors
+                .into_iter()
+                .next()
+                .expect("strict serial emit returns at most one error"))
+        }
     }
 
     /// 并发发出事件，并沿父链向上冒泡。
     pub async fn emit_parallel<E: Event>(&self, event: E) -> Result<(), Error> {
-        self.emit_impl(event, true).await
+        let errors = self.emit_impl(event, true, false).await;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::new(Phase::Event, ErrorKind::Multiple(errors)))
+        }
     }
 
-    async fn emit_impl<E: Event>(&self, event: E, parallel: bool) -> Result<(), Error> {
+    /// 旁路通知：串行执行事件，handler 错误不阻断后续 handler 和父链冒泡。
+    ///
+    /// 返回所有收集到的 handler 错误，由调用方决定如何记录。
+    pub async fn emit_notify<E: Event>(&self, event: E) -> Vec<Error> {
+        self.emit_impl(event, false, true).await
+    }
+
+    /// 旁路通知：并行执行事件，handler 错误不阻断父链冒泡。
+    ///
+    /// 返回所有收集到的 handler 错误，由调用方决定如何记录。
+    pub async fn emit_notify_parallel<E: Event>(&self, event: E) -> Vec<Error> {
+        self.emit_impl(event, true, true).await
+    }
+
+    async fn emit_impl<E: Event>(&self, event: E, parallel: bool, notify: bool) -> Vec<Error> {
         let mut current = Some(self.inner.clone());
+        let mut all_errors = Vec::new();
 
         while let Some(inner) = current {
             let handlers = inner.event_handlers_for::<E>();
@@ -803,42 +921,63 @@ impl Context {
                 inner: inner.clone(),
             };
 
+            let mut layer_errors = Vec::new();
+            let mut bail = false;
+
             if parallel {
                 let results = futures::future::join_all(
                     handlers.iter().map(|handler| handler.call(&event, &ctx)),
                 )
                 .await;
 
-                let mut errors = Vec::new();
-                let mut bail = false;
                 for result in results {
                     match result {
                         Ok(EventControl::Continue) => {}
                         Ok(EventControl::Bail) => bail = true,
-                        Err(err) => errors.push(err),
+                        Err(err) => layer_errors.push(err),
                     }
                 }
-
-                if !errors.is_empty() {
-                    return Err(Error::new(Phase::Event, ErrorKind::Multiple(errors)));
-                }
-                if bail {
-                    return Ok(());
-                }
-            } else {
+            } else if notify {
                 for handler in &handlers {
                     match handler.call(&event, &ctx).await {
                         Ok(EventControl::Continue) => {}
-                        Ok(EventControl::Bail) => return Ok(()),
-                        Err(err) => return Err(err),
+                        Ok(EventControl::Bail) => {
+                            bail = true;
+                            break;
+                        }
+                        Err(err) => layer_errors.push(err),
                     }
                 }
+            } else {
+                // 严格串行：保留旧语义，第一个错误立即停止。
+                for handler in &handlers {
+                    match handler.call(&event, &ctx).await {
+                        Ok(EventControl::Continue) => {}
+                        Ok(EventControl::Bail) => return all_errors,
+                        Err(err) => {
+                            all_errors.push(err);
+                            return all_errors;
+                        }
+                    }
+                }
+            }
+
+            // 严格并行模式：错误会聚合返回，不再继续向父层冒泡。
+            if !notify && parallel && !layer_errors.is_empty() {
+                all_errors.extend(layer_errors);
+                return all_errors;
+            }
+
+            all_errors.extend(layer_errors);
+
+            if bail {
+                return all_errors;
             }
 
             current = inner.parent.clone();
         }
 
-        Ok(())
+        all_errors
     }
 }
 
