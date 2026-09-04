@@ -64,10 +64,10 @@ src/
 
 ## 4. 依赖与排序
 
-- `compute_start_order` 与 `compute_start_layers` 是唯一依赖解析入口。
+- `compute_schedule` 是唯一依赖解析入口：串行拓扑序与并行分层必须来自同一张 `indegree`/`dependents` 图的一次计算。
 - Builder 与 Runtime 不得各自复制一份拓扑实现。
 - 可选依赖语义固定为：缺失可容忍，存在则必须按序启动。
-- 分层切分必须包含空层防御，出现空层应返回 `PluginDependencyCycle`，禁止静默死循环。
+- 环检测只发生在串行 Kahn 选点阶段（报 `PluginDependencyCycle`）；分层采用最长路径深度划分，图无环时层内容与非空性由构造保证，不得再引入独立于该图的第二套分层或空层防御分支。
 
 ---
 

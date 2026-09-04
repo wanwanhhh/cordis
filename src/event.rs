@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 
 use async_trait::async_trait;
 
-use crate::{Context, Error};
+use crate::{Context, Error, ErrorKind, Phase};
 
 /// 事件 marker。
 ///
@@ -108,9 +108,11 @@ where
         event: &(dyn Any + Send + Sync),
         ctx: &Context,
     ) -> Result<EventControl, Error> {
+        // 派发路径（含冻结后的按 TypeId 分组）已保证类型匹配；该分支实际
+        // 不可达。即使触达也以错误上报，绝不 panic 击穿用户的 await 点。
         let event = event
             .downcast_ref::<E>()
-            .expect("internal event type mismatch");
+            .ok_or_else(|| Error::new(Phase::Event, ErrorKind::Other))?;
         self.handler.handle(event, ctx).await
     }
 }

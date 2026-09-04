@@ -343,7 +343,7 @@ builder.provide(Arc::new(DynamicValue::new(initial_config)))?;
 
 `provide_dynamic` 实际注册的是 `Arc<DynamicValue<T>>`，不占用原始 `T` 的服务槽位；子作用域也能通过父链读取同一个动态配置句柄。
 
-> 注意：`DynamicValue` 底层使用 `RwLock`。如果写锁被 panic 污染，`read` / `write` / `set` / `update` 会直接 panic。
+> 注意：`DynamicValue` 底层使用 `RwLock`。持锁线程 panic 造成的锁中毒被容忍（与框架其余部分一致）：`read` / `write` / `set` / `update` 获取中毒态锁并继续工作，返回中毒时刻的数据，不会把单次用户 panic 放大为读路径崩溃。
 
 多字段需要同步变更时用 `write()` 拿独占引用，一次改完：
 

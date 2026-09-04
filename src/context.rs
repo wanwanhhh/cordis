@@ -1,6 +1,8 @@
 //! 三段式上下文模型：Builder / Context / Runtime。
 
 use std::any::TypeId;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,7 +16,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 
 use crate::event::{ErasedEventHandler, Subscription, TypedEventHandler};
-use crate::service::RegistrySnapshot;
+use crate::service::{RegistrySnapshot, TypeMap};
 use crate::{
     DynamicValue, Error, ErrorKind, Event, EventControl, EventHandler, Phase, Plugin, PluginScope,
     ServiceRegistry,
@@ -69,7 +71,11 @@ struct Data {
     parent: Option<Arc<Data>>,
     services: ServiceRegistry,
     plugin_names: Vec<&'static str>,
+    /// 装配阶段的可变 handler 列表；`build` 时按事件类型分组进 `handlers_by_type`。
     event_handlers: Vec<Arc<dyn ErasedEventHandler>>,
+    /// 冻结后的按事件类型分组表：emit 直接查表，避免每次全表扫描。
+    /// 只在 `Runtime` 暴露的 `Context` 上读取，读取前必已冻结。
+    handlers_by_type: TypeMap<Vec<Arc<dyn ErasedEventHandler>>>,
     next_subscription_id: usize,
     state: AtomicU64,
     children: Mutex<Vec<usize>>,
@@ -98,6 +104,7 @@ impl Data {
             services: ServiceRegistry::new(),
             plugin_names: Vec::new(),
             event_handlers: Vec::new(),
+            handlers_by_type: TypeMap::default(),
             next_subscription_id: 0,
             state: AtomicU64::new(0),
             children: Mutex::new(Vec::new()),
@@ -113,6 +120,7 @@ impl Data {
             services: ServiceRegistry::new(),
             plugin_names: Vec::new(),
             event_handlers: Vec::new(),
+            handlers_by_type: TypeMap::default(),
             next_subscription_id: 0,
             state: AtomicU64::new(0),
             children: Mutex::new(Vec::new()),
@@ -121,32 +129,56 @@ impl Data {
         }
     }
 
+    /// 冻结点：把装配阶段的 handler 列表按事件类型分组。`build` 在唯一一次
+    /// `Arc::new(data)` 之前调用；此后 emit 路径只读分组表。
+    fn freeze_event_handlers(&mut self) {
+        let handlers = std::mem::take(&mut self.event_handlers);
+        let mut grouped: TypeMap<Vec<Arc<dyn ErasedEventHandler>>> = TypeMap::default();
+        for handler in handlers {
+            grouped
+                .entry(handler.event_type_id())
+                .or_default()
+                .push(handler);
+        }
+        self.handlers_by_type = grouped;
+    }
+
+    /// 沿父链查找服务。miss 路径无分配；仅在整条链都未命中时构造一次错误。
+    ///
+    /// 类型不匹配与工厂初始化失败一律直接传播，不再被当作“本层缺失”继续向上
+    /// （旧实现中工厂返回的 `ServiceNotFound` 类错误会被误判为缺失而被跳过）。
     fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
-        match self.services.get::<T>() {
-            Ok(value) => Ok(value),
-            Err(err) => {
-                if matches!(err.kind, ErrorKind::ServiceNotFound(_)) {
-                    match &self.parent {
-                        Some(parent) => parent.require::<T>(),
-                        None => Err(Error::new(
+        let mut current = self;
+        loop {
+            match current.services.get_ref::<T>()? {
+                Some(value) => return Ok(value),
+                None => match &current.parent {
+                    Some(parent) => current = parent,
+                    None => {
+                        return Err(Error::new(
                             Phase::Build,
                             ErrorKind::ServiceNotFound(std::any::type_name::<T>().to_string()),
-                        )),
+                        ));
                     }
-                } else {
-                    Err(err)
-                }
+                },
             }
         }
     }
 
+    /// 沿父链尝试查找服务；链顶仍未命中返回 `Ok(None)`。
+    ///
+    /// 注意语义：服务不存在 → `Ok(None)`；但槽位存在且工厂初始化失败 →
+    /// `Err` 传播（工厂失败不等于“不存在”）。
     fn try_require<T: Send + Sync + 'static>(&self) -> Result<Option<&T>, Error> {
-        match self.services.try_get::<T>()? {
-            Some(value) => Ok(Some(value)),
-            None => match &self.parent {
-                Some(parent) => parent.try_require::<T>(),
-                None => Ok(None),
-            },
+        let mut current = self;
+        loop {
+            match current.services.get_ref::<T>()? {
+                Some(value) => return Ok(Some(value)),
+                None => match &current.parent {
+                    Some(parent) => current = parent,
+                    None => return Ok(None),
+                },
+            }
         }
     }
 
@@ -155,11 +187,15 @@ impl Data {
     }
 
     fn all_with_parents<T: Send + Sync + 'static>(&self) -> Result<Vec<&T>, Error> {
-        let mut values = self.services.all::<T>()?;
-        if let Some(parent) = &self.parent {
-            values.extend(parent.all_with_parents::<T>()?);
+        let mut current = self;
+        let mut values = Vec::new();
+        loop {
+            values.extend(current.services.all::<T>()?);
+            match &current.parent {
+                Some(parent) => current = parent,
+                None => return Ok(values),
+            }
         }
-        Ok(values)
     }
 
     /// 局部 + 父链的完整存在性检查（普通服务 / 工厂 / 集合）。
@@ -184,12 +220,11 @@ impl Data {
         }
     }
 
-    fn event_handlers_for<E: Event>(&self) -> Vec<Arc<dyn ErasedEventHandler>> {
-        self.event_handlers
-            .iter()
-            .filter(|handler| handler.event_type_id() == std::any::TypeId::of::<E>())
-            .cloned()
-            .collect()
+    /// 返回本层注册了事件 `E` 的 handler（注册序）。要求 `Data` 已冻结。
+    fn event_handlers_for<E: Event>(&self) -> &[Arc<dyn ErasedEventHandler>] {
+        self.handlers_by_type
+            .get(&TypeId::of::<E>())
+            .map_or(&[], Vec::as_slice)
     }
 
     fn has_plugin(&self, name: &str) -> bool {
@@ -230,26 +265,42 @@ impl PluginRecord {
     }
 }
 
-/// 统一的插件依赖拓扑排序。
+/// 从同一张依赖图一次算出的启动调度：串行拓扑序与可并发分层。
+struct Schedule {
+    /// 串行启动顺序（`start_serial` 与停止逆序的基准）。
+    order: Vec<usize>,
+    /// 分层并行启动的层序列；同层内无尚未启动的本地依赖边。
+    layers: Vec<Vec<usize>>,
+}
+
+/// 统一依赖图的调度计算。
 ///
-/// `local_names` 是本层已注册插件名；`has_plugin` 用于检查父级插件是否存在。
-/// 可选插件依赖只放宽“必须存在”的校验，不改变“存在则必须按依赖顺序启动”的语义。
-fn compute_start_order(
+/// `local_names` 是本层已注册插件名（与 `plugins` 索引对齐）；`has_plugin` 用于
+/// 检查父级插件是否存在。可选插件依赖只放宽“必须存在”的校验，不改变“存在则
+/// 必须按依赖顺序启动”的语义。
+///
+/// 串行序与分层共享同一张 `indegree`/`dependents` 图，二者不可能发散；
+/// 环检测只在 Kahn 贪心选点阶段发生一次。
+fn compute_schedule(
     plugins: &[PluginRecord],
     local_names: &[&'static str],
     has_plugin: impl Fn(&str) -> bool,
-) -> Result<Vec<usize>, Error> {
+) -> Result<Schedule, Error> {
     let n = plugins.len();
+
+    // 插件名 -> 索引。名字唯一性由注册阶段保证。
+    let mut position: HashMap<&'static str, usize> = HashMap::with_capacity(n);
+    for (index, name) in local_names.iter().enumerate() {
+        position.insert(*name, index);
+    }
+
     let mut indegree = vec![0usize; n];
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
 
     for (i, record) in plugins.iter().enumerate() {
         for plugin_dependency in &record.plugin_deps {
-            match local_names
-                .iter()
-                .position(|name| *name == plugin_dependency.plugin_name)
-            {
-                Some(j) => {
+            match position.get(plugin_dependency.plugin_name) {
+                Some(&j) => {
                     dependents[j].push(i);
                     indegree[i] += 1;
                 }
@@ -268,80 +319,50 @@ fn compute_start_order(
         }
     }
 
+    // 串行序：Kahn 贪心，零入度候选中优先取高 priority、同 priority 取注册序靠前。
+    // 二叉堆 + 每节点仅在入度归零时入堆一次，复杂度 O(P log P + E)。
     let mut order = Vec::with_capacity(n);
-    let mut remaining: Vec<usize> = (0..n).collect();
-
-    while !remaining.is_empty() {
-        let candidates: Vec<usize> = remaining
-            .iter()
-            .copied()
-            .filter(|&index| indegree[index] == 0)
-            .collect();
-
-        if candidates.is_empty() {
-            return Err(Error::new(Phase::Verify, ErrorKind::PluginDependencyCycle));
-        }
-
-        let next = *candidates
-            .iter()
-            .max_by(|&&a, &&b| {
-                plugins[a]
-                    .priority()
-                    .cmp(&plugins[b].priority())
-                    .then(b.cmp(&a))
-            })
-            .expect("candidates is not empty");
-
-        order.push(next);
-
-        for &dependent in &dependents[next] {
-            indegree[dependent] -= 1;
-        }
-
-        remaining.retain(|&index| index != next);
-    }
-
-    Ok(order)
-}
-
-/// 把拓扑序切分为可并发的层。
-///
-/// 同一层内没有尚未启动的本地插件依赖；父级插件依赖不产生本地层间边。
-fn compute_start_layers(
-    plugins: &[PluginRecord],
-    order: &[usize],
-) -> Result<Vec<Vec<usize>>, Error> {
-    let mut remaining: Vec<usize> = order.to_vec();
-    let mut layers = Vec::new();
-
-    while !remaining.is_empty() {
-        let mut layer = Vec::new();
-        let mut next_remaining = Vec::new();
-
-        for &index in &remaining {
-            let depends_on_remaining = plugins[index].plugin_deps.iter().any(|dep| {
-                remaining
-                    .iter()
-                    .any(|&r| plugins[r].name() == dep.plugin_name)
-            });
-
-            if depends_on_remaining {
-                next_remaining.push(index);
-            } else {
-                layer.push(index);
+    {
+        let mut indeg = indegree.clone();
+        let mut heap: BinaryHeap<(i32, Reverse<usize>)> = BinaryHeap::with_capacity(n);
+        for (index, &deg) in indeg.iter().enumerate() {
+            if deg == 0 {
+                heap.push((plugins[index].priority(), Reverse(index)));
             }
         }
-
-        if layer.is_empty() {
-            // 该状态与拓扑排序结果矛盾，说明内部依赖解析不一致；应直接暴露，避免静默死循环。
-            return Err(Error::new(Phase::Start, ErrorKind::PluginDependencyCycle));
+        while let Some((_, Reverse(index))) = heap.pop() {
+            order.push(index);
+            for &dependent in &dependents[index] {
+                indeg[dependent] -= 1;
+                if indeg[dependent] == 0 {
+                    heap.push((plugins[dependent].priority(), Reverse(dependent)));
+                }
+            }
         }
-
-        layers.push(layer);
-        remaining = next_remaining;
+        if order.len() != n {
+            return Err(Error::new(Phase::Verify, ErrorKind::PluginDependencyCycle));
+        }
     }
 
-    Ok(layers)
+    // 分层：最长路径深度（Kahn 逐轮取全部零入度节点的等价形式）。
+    // 图已确认无环，每个节点的深度良定义，层内容与非空性无需防御分支。
+    let mut depth = vec![0usize; n];
+    for &index in &order {
+        let next_depth = depth[index] + 1;
+        for &dependent in &dependents[index] {
+            if depth[dependent] < next_depth {
+                depth[dependent] = next_depth;
+            }
+        }
+    }
+    let layer_count = depth.iter().copied().max().map_or(0, |max| max + 1);
+    let mut layers: Vec<Vec<usize>> = vec![Vec::new(); layer_count];
+    for &index in &order {
+        layers[depth[index]].push(index);
+    }
+    // 层内保持拓扑序输出，与旧实现的 remaining 过滤次序一致。
+
+    Ok(Schedule { order, layers })
 }
 
 /// 子作用域租约：持有父 `Data` 强引用，`Drop` 时从父注册表摘除子 id 并归还父计数。
@@ -567,6 +588,9 @@ impl Builder {
     }
 
     /// 尝试获取服务（普通服务或工厂，含父级）。
+    ///
+    /// 语义：服务不存在返回 `Ok(None)`；但槽位存在（如工厂）且初始化失败时
+    /// 返回 `Err`——工厂失败不等于“不存在”，调用方不应把 `Err` 当作缺失处理。
     pub fn try_require<T: Send + Sync + 'static>(&self) -> Result<Option<&T>, Error> {
         self.data.try_require()
     }
@@ -680,12 +704,12 @@ impl Builder {
             }
         }
 
-        self.compute_start_order()?;
+        self.compute_schedule()?;
         Ok(())
     }
 
-    fn compute_start_order(&self) -> Result<Vec<usize>, Error> {
-        compute_start_order(&self.plugins, &self.data.plugin_names, |name| {
+    fn compute_schedule(&self) -> Result<Schedule, Error> {
+        compute_schedule(&self.plugins, &self.data.plugin_names, |name| {
             self.data.has_plugin(name)
         })
     }
@@ -695,7 +719,11 @@ impl Builder {
     /// 冻结点是唯一一次 `Arc::new(data)`。
     pub fn build(self) -> Result<Runtime, Error> {
         self.verify()?;
+        Ok(self.build_validated())
+    }
 
+    /// 假定校验已通过的内部构造；`build` 与 `try_build` 共用，校验只跑一遍。
+    fn build_validated(self) -> Runtime {
         let Builder {
             data,
             plugins,
@@ -704,7 +732,10 @@ impl Builder {
             lease,
         } = self;
 
-        Ok(Runtime {
+        let mut data = data;
+        data.freeze_event_handlers();
+
+        Runtime {
             ctx: Context {
                 inner: Arc::new(data),
             },
@@ -715,7 +746,7 @@ impl Builder {
             stopped: false,
             started_plugins: Vec::new(),
             _lease: lease,
-        })
+        }
     }
 
     /// 消费 Builder；校验失败时把 Builder（含租约）完整带回。
@@ -725,7 +756,7 @@ impl Builder {
             return Err((self, err));
         }
 
-        Ok(self.build().expect("verify() already succeeded"))
+        Ok(self.build_validated())
     }
 }
 
@@ -882,6 +913,9 @@ impl Context {
     }
 
     /// 尝试获取服务（普通服务或工厂，含父级）。
+    ///
+    /// 语义：服务不存在返回 `Ok(None)`；但槽位存在（如工厂）且初始化失败时
+    /// 返回 `Err`——工厂失败不等于“不存在”，调用方不应把 `Err` 当作缺失处理。
     pub fn try_require<T: Send + Sync + 'static>(&self) -> Result<Option<&T>, Error> {
         self.inner.try_require()
     }
@@ -948,6 +982,9 @@ impl Context {
     /// （沿父链冒泡）；任务 panic 不会被捕获，只在停止阶段以
     /// [`ErrorKind::TaskFailed`] 上报。
     ///
+    /// [`TaskFailed`] 的发出有意不受停止标志限制：排空阶段结束的任务即使本层
+    /// 已进入 stopping，其失败事件仍会冒泡，失败报告不会因停止时序而丢失。
+    ///
     /// 要求当前线程处于 tokio runtime 上下文；本层进入停止后调用返回
     /// [`ErrorKind::Stopping`]。
     #[cfg(feature = "tokio")]
@@ -988,6 +1025,10 @@ impl Context {
         tasks.len()
     }
 
+    /// 任务表锁。关键不变式（`spawn` 与 `drain_tasks` 共用此锁）：
+    /// `spawn` 的“STOPPED 检查 + push”在同一次持锁内完成，而 `stop_impl` 先
+    /// 置 STOPPED、之后才 `take` 任务表——因此任何通过检查的任务必在排空前
+    /// 入表，不存在“停止竞态丢任务”。修改任一侧的持锁顺序前必须先推翻此论证。
     #[cfg(feature = "tokio")]
     fn lock_tasks(&self) -> MutexGuard<'_, Vec<TrackedTask>> {
         self.inner
@@ -1073,7 +1114,7 @@ impl Context {
                     }
                 }
             } else if notify {
-                for handler in &handlers {
+                for handler in handlers {
                     match handler.call(&event, &ctx).await {
                         Ok(EventControl::Continue) => {}
                         Ok(EventControl::Bail) => {
@@ -1085,7 +1126,7 @@ impl Context {
                 }
             } else {
                 // 严格串行：保留旧语义，第一个错误立即停止。
-                for handler in &handlers {
+                for handler in handlers {
                     match handler.call(&event, &ctx).await {
                         Ok(EventControl::Continue) => {}
                         Ok(EventControl::Bail) => return all_errors,
@@ -1154,12 +1195,13 @@ impl Runtime {
             return Ok(());
         }
 
-        let order = self.compute_start_order()?;
+        // 单一依赖图同时给出串行序与并行层；调度计算失败时不进入 started 状态。
+        let schedule = self.compute_schedule()?;
         self.started = true;
 
         let mut errors = Vec::new();
         if serial {
-            for &index in &order {
+            for &index in &schedule.order {
                 self.started_plugins.push(index);
                 let record = &self.plugins[index];
                 if let Err(err) = record.plugin.start(&self.ctx).await {
@@ -1169,16 +1211,7 @@ impl Runtime {
             }
         } else {
             // 分层并行：拓扑同层无依赖边，可并发启动。
-            let layers = match compute_start_layers(&self.plugins, &order) {
-                Ok(layers) => layers,
-                Err(err) => {
-                    self.started = false;
-                    errors.push(err);
-                    return Err(Error::new(Phase::Start, ErrorKind::Multiple(errors)));
-                }
-            };
-
-            for layer in layers {
+            for layer in schedule.layers {
                 self.started_plugins.extend(layer.iter().copied());
                 let layer_plugins: Vec<(usize, &dyn Plugin)> = layer
                     .iter()
@@ -1229,8 +1262,8 @@ impl Runtime {
         self.start_with(true).await
     }
 
-    fn compute_start_order(&self) -> Result<Vec<usize>, Error> {
-        compute_start_order(&self.plugins, &self.ctx.inner.plugin_names, |name| {
+    fn compute_schedule(&self) -> Result<Schedule, Error> {
+        compute_schedule(&self.plugins, &self.ctx.inner.plugin_names, |name| {
             self.ctx.inner.has_plugin(name)
         })
     }
@@ -1253,6 +1286,10 @@ impl Runtime {
     ///
     /// 仅在启用 `tokio` feature 且使用过 `Context::spawn` 时有实际差异；
     /// 插件 `stop` 与 dispose 回调本身不受该预算约束。
+    ///
+    /// 超时排空使用 `tokio::time` 定时器，要求当前 runtime 启用了 time
+    /// driver（标准 `new_multi_thread` / 显式 `enable_time` 的
+    /// `new_current_thread` 均满足）。
     pub async fn stop_with_timeout(&mut self, timeout: Duration) -> Result<(), Error> {
         self.stop_impl(Some(timeout)).await
     }
@@ -1330,7 +1367,9 @@ impl Runtime {
                 None => join.await,
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    match futures::future::select(Box::pin(sleep_std(remaining)), join).await {
+                    match futures::future::select(Box::pin(tokio::time::sleep(remaining)), join)
+                        .await
+                    {
                         futures::future::Either::Left(((), join)) => {
                             join.abort();
                             errors.push(Error::new(
@@ -1368,16 +1407,3 @@ impl Drop for Runtime {
     }
 }
 
-/// 执行器无关的一次性定时器：后台线程睡眠 + oneshot 通知。
-#[cfg(feature = "tokio")]
-fn sleep_std(dur: Duration) -> impl Future<Output = ()> + Send {
-    let (tx, rx) = futures::channel::oneshot::channel::<()>();
-    std::thread::spawn(move || {
-        std::thread::sleep(dur);
-        let _ = tx.send(());
-    });
-    async move {
-        // 通知线程必然存活至发送；RecvError 同样视为超时已触发。
-        let _ = rx.await;
-    }
-}
