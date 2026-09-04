@@ -41,14 +41,20 @@ pub enum ErrorKind {
         expected: PluginScope,
         actual: PluginScope,
     },
-    /// 父 Runtime 停止时仍有活跃子 Runtime。
-    ActiveScopes { count: u64 },
-    /// 父已进入停止，拒绝新 scope。
+    /// 父 Runtime 停止时仍有活跃子 Runtime（含活跃子作用域 id 清单）。
+    ActiveScopes { count: u64, ids: Vec<usize> },
+    /// 父已进入停止，拒绝新 scope / spawn。
     Stopping,
     /// scope 数量超限。
     TooManyScopes,
     /// 事件订阅不存在或不属于当前 Context。
     SubscriptionNotFound,
+    /// `Context::spawn` 时不存在可用的 tokio runtime 上下文。
+    NoTaskRuntime,
+    /// `Context::spawn` 的后台任务 panic（仅在停止排空阶段上报）。
+    TaskFailed { task_id: u64 },
+    /// 优雅停止超时，后台任务被强制取消。
+    TaskAborted { task_id: u64 },
     /// 承载插件自定义来源。
     Other,
     /// 停止/并行 start 的聚合错误。
@@ -171,13 +177,26 @@ impl fmt::Display for Error {
                     self.phase
                 )
             }
-            ErrorKind::ActiveScopes { count } => {
-                write!(f, "{:?}: active scopes: {count}", self.phase)
+            ErrorKind::ActiveScopes { count, ids } => {
+                write!(f, "{:?}: active scopes: {count}, ids: {ids:?}", self.phase)
             }
             ErrorKind::Stopping => write!(f, "{:?}: stopping", self.phase),
             ErrorKind::TooManyScopes => write!(f, "{:?}: too many scopes", self.phase),
             ErrorKind::SubscriptionNotFound => {
                 write!(f, "{:?}: event subscription not found", self.phase)
+            }
+            ErrorKind::NoTaskRuntime => {
+                write!(f, "{:?}: no tokio runtime context for spawn", self.phase)
+            }
+            ErrorKind::TaskFailed { task_id } => {
+                write!(f, "{:?}: background task {task_id} panicked", self.phase)
+            }
+            ErrorKind::TaskAborted { task_id } => {
+                write!(
+                    f,
+                    "{:?}: background task {task_id} aborted after drain timeout",
+                    self.phase
+                )
             }
             ErrorKind::Other => write!(f, "{:?}: other error", self.phase),
             ErrorKind::Multiple(errors) => {

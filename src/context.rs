@@ -1,14 +1,20 @@
 //! 三段式上下文模型：Builder / Context / Runtime。
 
 use std::any::TypeId;
-use std::collections::HashSet;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+#[cfg(feature = "tokio")]
+use std::sync::MutexGuard;
+#[cfg(feature = "tokio")]
+use std::time::Instant;
 
 use async_trait::async_trait;
 
 use crate::event::{ErasedEventHandler, Subscription, TypedEventHandler};
+use crate::service::RegistrySnapshot;
 use crate::{
     DynamicValue, Error, ErrorKind, Event, EventControl, EventHandler, Phase, Plugin, PluginScope,
     ServiceRegistry,
@@ -66,6 +72,22 @@ struct Data {
     event_handlers: Vec<Arc<dyn ErasedEventHandler>>,
     next_subscription_id: usize,
     state: AtomicU64,
+    children: Mutex<Vec<usize>>,
+    #[cfg(feature = "tokio")]
+    tasks: TaskRegistry,
+}
+
+#[cfg(feature = "tokio")]
+#[derive(Default)]
+struct TaskRegistry {
+    tasks: Mutex<Vec<TrackedTask>>,
+    next_id: AtomicU64,
+}
+
+#[cfg(feature = "tokio")]
+struct TrackedTask {
+    id: u64,
+    join: tokio::task::JoinHandle<()>,
 }
 
 impl Data {
@@ -78,6 +100,9 @@ impl Data {
             event_handlers: Vec::new(),
             next_subscription_id: 0,
             state: AtomicU64::new(0),
+            children: Mutex::new(Vec::new()),
+            #[cfg(feature = "tokio")]
+            tasks: TaskRegistry::default(),
         }
     }
 
@@ -90,6 +115,9 @@ impl Data {
             event_handlers: Vec::new(),
             next_subscription_id: 0,
             state: AtomicU64::new(0),
+            children: Mutex::new(Vec::new()),
+            #[cfg(feature = "tokio")]
+            tasks: TaskRegistry::default(),
         }
     }
 
@@ -134,10 +162,18 @@ impl Data {
         Ok(values)
     }
 
+    /// 局部 + 父链的完整存在性检查（普通服务 / 工厂 / 集合）。
     fn contains<T: Send + Sync + 'static>(&self) -> bool {
-        self.services.contains::<T>() || self.contains_type(TypeId::of::<T>())
+        if self.services.contains::<T>() {
+            return true;
+        }
+        match &self.parent {
+            Some(parent) => parent.contains::<T>(),
+            None => false,
+        }
     }
 
+    /// 单例依赖语义：集合服务不满足依赖，仅普通服务与工厂参与校验。
     fn contains_type(&self, type_id: TypeId) -> bool {
         if self.services.contains_type(type_id) {
             return true;
@@ -168,7 +204,7 @@ impl Data {
 }
 
 type Snapshot = (
-    HashSet<TypeId>,
+    RegistrySnapshot,
     usize,
     usize,
     usize,
@@ -308,12 +344,20 @@ fn compute_start_layers(
     Ok(layers)
 }
 
-/// 子作用域租约：持有父 `Data` 强引用，`Drop` 时归还父计数。
-struct ScopeLease(Arc<Data>);
+/// 子作用域租约：持有父 `Data` 强引用，`Drop` 时从父注册表摘除子 id 并归还父计数。
+struct ScopeLease {
+    parent: Arc<Data>,
+    child_id: usize,
+}
 
 impl Drop for ScopeLease {
     fn drop(&mut self) {
-        self.0.state.fetch_sub(1, Ordering::SeqCst);
+        self.parent
+            .children
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|id| *id != self.child_id);
+        self.parent.state.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -338,13 +382,20 @@ impl Builder {
         }
     }
 
-    fn child(parent: Arc<Data>, lease: ScopeLease) -> Self {
+    fn child(parent: Arc<Data>) -> Self {
+        let data = Data::child(parent.clone());
+        let child_id = data.context_id;
+        parent
+            .children
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(child_id);
         Self {
-            data: Data::child(parent),
+            data,
             plugins: Vec::new(),
             ready: Vec::new(),
             dispose: Vec::new(),
-            lease: Some(lease),
+            lease: Some(ScopeLease { parent, child_id }),
         }
     }
 
@@ -368,7 +419,7 @@ impl Builder {
 
     fn snapshot(&self) -> Snapshot {
         (
-            self.data.services.type_ids(),
+            self.data.services.snapshot(),
             self.plugins.len(),
             self.data.plugin_names.len(),
             self.ready.len(),
@@ -380,7 +431,7 @@ impl Builder {
 
     fn restore(&mut self, snapshot: Snapshot) {
         let (
-            service_keys,
+            registry,
             plugin_len,
             plugin_names_len,
             ready_len,
@@ -388,7 +439,7 @@ impl Builder {
             event_handlers,
             next_subscription_id,
         ) = snapshot;
-        self.data.services.retain(&service_keys);
+        self.data.services.restore(registry);
         self.plugins.truncate(plugin_len);
         self.data.plugin_names.truncate(plugin_names_len);
         self.ready.truncate(ready_len);
@@ -473,11 +524,11 @@ impl Builder {
         P: Plugin,
         C: Send + Sync + 'static,
     {
-        let snapshot = self.data.services.type_ids();
+        let registry = self.data.services.snapshot();
         self.provide(config)?;
 
         if let Err(err) = self.plugin(plugin) {
-            self.data.services.retain(&snapshot);
+            self.data.services.restore(registry);
             return Err(err);
         }
 
@@ -823,10 +874,7 @@ impl Context {
                 Ordering::SeqCst,
             ) {
                 Ok(_) => {
-                    return Ok(Builder::child(
-                        self.inner.clone(),
-                        ScopeLease(self.inner.clone()),
-                    ));
+                    return Ok(Builder::child(self.inner.clone()));
                 }
                 Err(_) => continue,
             }
@@ -866,6 +914,93 @@ impl Context {
     /// 判断某个插件是否已注册（局部 + 父级）。
     pub fn has_plugin(&self, name: &str) -> bool {
         self.inner.has_plugin(name)
+    }
+
+    /// 本层是否已进入停止（`Runtime::stop` 已置位停止标志）。
+    pub fn is_stopping(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) & STOPPED != 0
+    }
+
+    /// 父级 Context 句柄；根级为 `None`。
+    pub fn parent(&self) -> Option<Context> {
+        self.inner.parent.clone().map(|inner| Context { inner })
+    }
+
+    /// 本层活跃子作用域的 context id 清单。
+    ///
+    /// 包含尚未 build 的子 Builder 与尚未 drop 的子 Runtime；子作用域停止后
+    /// 仍需 drop 才会从清单中消失。
+    pub fn children(&self) -> Vec<usize> {
+        match self.inner.children.lock() {
+            Ok(children) => children.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// 注册并启动绑定到本作用域生命周期的后台任务。
+    ///
+    /// 任务在停止阶段被排空（见 [`Runtime::stop`] / [`Runtime::stop_with_timeout`]）：
+    /// - `Runtime::stop` 会等待全部已注册任务完成；
+    /// - `Runtime::stop_with_timeout` 在预算内等待，超时后强制取消并上报
+    ///   [`ErrorKind::TaskAborted`]。
+    ///
+    /// 任务返回 `Err` 时，会以旁路通知方式向本作用域发出 [`TaskFailed`] 事件
+    /// （沿父链冒泡）；任务 panic 不会被捕获，只在停止阶段以
+    /// [`ErrorKind::TaskFailed`] 上报。
+    ///
+    /// 要求当前线程处于 tokio runtime 上下文；本层进入停止后调用返回
+    /// [`ErrorKind::Stopping`]。
+    #[cfg(feature = "tokio")]
+    pub fn spawn<F>(&self, fut: F) -> Result<u64, Error>
+    where
+        F: Future<Output = Result<(), Error>> + Send + 'static,
+    {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| Error::new(Phase::Build, ErrorKind::NoTaskRuntime))?;
+        let mut tasks = self.lock_tasks();
+        if self.inner.state.load(Ordering::Acquire) & STOPPED != 0 {
+            return Err(Error::new(Phase::Build, ErrorKind::Stopping));
+        }
+        tasks.retain(|task| !task.join.is_finished());
+        let id = self.inner.tasks.next_id.fetch_add(1, Ordering::Relaxed);
+        let ctx = self.clone();
+        let join = handle.spawn(async move {
+            let result = fut.await;
+            ctx.remove_task(id);
+            if let Err(err) = result {
+                let _ = ctx
+                    .emit_notify(TaskFailed {
+                        task_id: id,
+                        error: Arc::new(err),
+                    })
+                    .await;
+            }
+        });
+        tasks.push(TrackedTask { id, join });
+        Ok(id)
+    }
+
+    /// 当前已注册且仍活跃的后台任务数量。
+    #[cfg(feature = "tokio")]
+    pub fn task_count(&self) -> usize {
+        let mut tasks = self.lock_tasks();
+        tasks.retain(|task| !task.join.is_finished());
+        tasks.len()
+    }
+
+    #[cfg(feature = "tokio")]
+    fn lock_tasks(&self) -> MutexGuard<'_, Vec<TrackedTask>> {
+        self.inner
+            .tasks
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(feature = "tokio")]
+    fn remove_task(&self, id: u64) {
+        let mut tasks = self.lock_tasks();
+        tasks.retain(|task| task.id != id);
     }
 
     /// 测试用：读取本层活跃子 Runtime/Builder 的租约计数。
@@ -981,6 +1116,18 @@ impl Context {
     }
 }
 
+/// 后台任务失败事件。
+///
+/// 由 [`Context::spawn`] 的任务在返回 `Err` 时以旁路通知发出，沿父链冒泡；
+/// handler 错误不会反向影响任务。
+#[derive(Debug)]
+pub struct TaskFailed {
+    /// 任务 id（`Context::spawn` 的返回值，作用域内唯一）。
+    pub task_id: u64,
+    /// 任务返回的错误。
+    pub error: Arc<Error>,
+}
+
 /// 生命周期唯一所有者；不 `Clone`，`#[must_use]`。
 #[must_use]
 pub struct Runtime {
@@ -1091,8 +1238,26 @@ impl Runtime {
     /// 异步停止。
     ///
     /// 父/自身 `Runtime::stop` 只接受本层没有活跃子 Runtime；若仍有活跃子，
-    /// 返回 `ActiveScopes`，且不进入停止状态。
+    /// 返回 `ActiveScopes`（含子作用域 id 清单），且不进入停止状态。
+    ///
+    /// 已注册后台任务的排空不设超时，等待全部任务自然完成。
     pub async fn stop(&mut self) -> Result<(), Error> {
+        self.stop_impl(None).await
+    }
+
+    /// 带总预算的优雅停止。
+    ///
+    /// 与 [`Runtime::stop`] 相同，但 `Context::spawn` 注册的任务排空共享
+    /// `timeout` 预算：预算耗尽仍未完成的任务会被强制取消，并以
+    /// `ErrorKind::TaskAborted` 计入聚合错误。
+    ///
+    /// 仅在启用 `tokio` feature 且使用过 `Context::spawn` 时有实际差异；
+    /// 插件 `stop` 与 dispose 回调本身不受该预算约束。
+    pub async fn stop_with_timeout(&mut self, timeout: Duration) -> Result<(), Error> {
+        self.stop_impl(Some(timeout)).await
+    }
+
+    async fn stop_impl(&mut self, task_drain_timeout: Option<Duration>) -> Result<(), Error> {
         if self.stopped {
             return Ok(());
         }
@@ -1109,6 +1274,7 @@ impl Runtime {
                     Phase::Stop,
                     ErrorKind::ActiveScopes {
                         count: s & COUNT_MASK,
+                        ids: self.ctx.children(),
                     },
                 ));
             }
@@ -1130,6 +1296,12 @@ impl Runtime {
             }
         }
 
+        #[cfg(feature = "tokio")]
+        self.drain_tasks(task_drain_timeout, &mut errors).await;
+
+        #[cfg(not(feature = "tokio"))]
+        let _ = task_drain_timeout;
+
         let ctx = self.ctx.clone();
         for hook in &mut self.dispose {
             if let Err(err) = hook.call(&ctx).await {
@@ -1143,10 +1315,69 @@ impl Runtime {
             Err(Error::new(Phase::Stop, ErrorKind::Multiple(errors)))
         }
     }
+
+    /// 排空本层登记的后台任务：插件 stop 之后、dispose 之前执行。
+    #[cfg(feature = "tokio")]
+    async fn drain_tasks(&self, task_drain_timeout: Option<Duration>, errors: &mut Vec<Error>) {
+        let pending: Vec<TrackedTask> = std::mem::take(&mut *self.ctx.lock_tasks());
+        if pending.is_empty() {
+            return;
+        }
+
+        let deadline = task_drain_timeout.map(|budget| Instant::now() + budget);
+        for TrackedTask { id, join } in pending {
+            let result = match deadline {
+                None => join.await,
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match futures::future::select(Box::pin(sleep_std(remaining)), join).await {
+                        futures::future::Either::Left(((), join)) => {
+                            join.abort();
+                            errors.push(Error::new(
+                                Phase::Stop,
+                                ErrorKind::TaskAborted { task_id: id },
+                            ));
+                            continue;
+                        }
+                        futures::future::Either::Right((result, _sleep)) => result,
+                    }
+                }
+            };
+            match result {
+                Ok(()) => {}
+                Err(join_err) if join_err.is_panic() => {
+                    errors.push(Error::new(
+                        Phase::Stop,
+                        ErrorKind::TaskFailed { task_id: id },
+                    ));
+                }
+                Err(_) => {
+                    errors.push(Error::new(
+                        Phase::Stop,
+                        ErrorKind::TaskAborted { task_id: id },
+                    ));
+                }
+            }
+        }
+    }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
         // 不做异步清理。租约释放由最后一个字段 `ScopeLease` 在字段析构阶段完成。
+    }
+}
+
+/// 执行器无关的一次性定时器：后台线程睡眠 + oneshot 通知。
+#[cfg(feature = "tokio")]
+fn sleep_std(dur: Duration) -> impl Future<Output = ()> + Send {
+    let (tx, rx) = futures::channel::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(dur);
+        let _ = tx.send(());
+    });
+    async move {
+        // 通知线程必然存活至发送；RecvError 同样视为超时已触发。
+        let _ = rx.await;
     }
 }

@@ -44,7 +44,9 @@ mod event;
 mod plugin;
 mod service;
 
-pub use context::{AsyncHook, Builder, Configurator, Context, LifecycleHook, Runtime, SyncHook};
+pub use context::{
+    AsyncHook, Builder, Configurator, Context, LifecycleHook, Runtime, SyncHook, TaskFailed,
+};
 pub use error::{Error, ErrorKind, Phase};
 pub use event::{
     AsyncFnEventHandler, Event, EventControl, EventHandler, FnEventHandler, Subscription,
@@ -565,15 +567,17 @@ mod tests {
 
         let scope_builder = ctx.scope().unwrap();
 
-        assert!(matches!(
-            block_on(rt.stop()),
-            Err(Error {
-                kind: ErrorKind::ActiveScopes { count: 1 },
-                ..
-            })
-        ));
+        let err = block_on(rt.stop()).unwrap_err();
+        match err.kind {
+            ErrorKind::ActiveScopes { count: 1, ids } => {
+                assert_eq!(ids, ctx.children());
+                assert_eq!(ids.len(), 1);
+            }
+            other => panic!("unexpected error kind: {other:?}"),
+        }
 
         drop(scope_builder);
+        assert!(ctx.children().is_empty());
         block_on(rt.stop()).unwrap();
     }
 
@@ -590,7 +594,7 @@ mod tests {
         assert!(matches!(
             block_on(rt.stop()),
             Err(Error {
-                kind: ErrorKind::ActiveScopes { count: 1 },
+                kind: ErrorKind::ActiveScopes { count: 1, .. },
                 ..
             })
         ));
@@ -600,7 +604,7 @@ mod tests {
         assert!(matches!(
             block_on(rt.stop()),
             Err(Error {
-                kind: ErrorKind::ActiveScopes { count: 1 },
+                kind: ErrorKind::ActiveScopes { count: 1, .. },
                 ..
             })
         ));
@@ -731,7 +735,7 @@ mod tests {
         assert!(matches!(
             block_on(rt.stop()),
             Err(Error {
-                kind: ErrorKind::ActiveScopes { count: 2 },
+                kind: ErrorKind::ActiveScopes { count: 2, .. },
                 ..
             })
         ));
@@ -740,7 +744,7 @@ mod tests {
         assert!(matches!(
             block_on(rt.stop()),
             Err(Error {
-                kind: ErrorKind::ActiveScopes { count: 1 },
+                kind: ErrorKind::ActiveScopes { count: 1, .. },
                 ..
             })
         ));
@@ -2015,5 +2019,239 @@ mod tests {
             *ctx.require_dynamic::<String>().unwrap().read(),
             "child-updated"
         );
+    }
+
+    struct RollbackTool(&'static str);
+
+    struct FailingCollect;
+
+    impl Plugin for FailingCollect {
+        fn name(&self) -> &'static str {
+            "failing-collect"
+        }
+
+        fn apply(&self, cfg: &mut Configurator<'_>) -> Result<(), Error> {
+            cfg.provide_collect(RollbackTool("bad"))?;
+            Err(Error::new(Phase::Apply, ErrorKind::Other))
+        }
+    }
+
+    #[test]
+    fn contains_sees_ancestor_collection() {
+        let mut builder = Builder::new();
+        builder.provide_collect(RollbackTool("root")).unwrap();
+        let rt = builder.build().unwrap();
+        let scope = rt.handle().scope().unwrap();
+        assert!(scope.contains::<RollbackTool>());
+        assert!(rt.handle().contains::<RollbackTool>());
+    }
+
+    #[test]
+    fn failed_plugin_rolls_back_collection_elements() {
+        let mut builder = Builder::new();
+        builder.provide_collect(RollbackTool("root")).unwrap();
+        let err = builder.plugin(FailingCollect).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Other));
+        let all = builder.require_all::<RollbackTool>().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "root");
+    }
+
+    struct ConcurrentLazy(u64);
+
+    #[test]
+    fn concurrent_factory_runs_at_most_once_on_success() {
+        let mut builder = Builder::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let inside = calls.clone();
+        builder
+            .provide_factory(move || -> Result<ConcurrentLazy, Error> {
+                inside.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(ConcurrentLazy(42))
+            })
+            .unwrap();
+        let rt = builder.build().unwrap();
+        let ctx = rt.handle();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = ctx.clone();
+            handles.push(std::thread::spawn(move || {
+                c.require::<ConcurrentLazy>().unwrap().0
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), 42);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stopped_child_scope_is_observable() {
+        let rt = Builder::new().build().unwrap();
+        let ctx = rt.handle();
+        let scope = ctx.scope().unwrap();
+        let mut scope_rt = scope.build().unwrap();
+        let scope_ctx = scope_rt.handle();
+        assert!(!scope_ctx.is_stopping());
+        assert_eq!(ctx.children().len(), 1);
+        assert!(ctx.parent().is_none());
+        assert!(scope_ctx.parent().is_some());
+
+        block_on(scope_rt.stop()).unwrap();
+        assert!(scope_ctx.is_stopping());
+        // 子 Runtime 停止后未 drop 前仍占租约，出现在父清单中。
+        assert_eq!(ctx.children().len(), 1);
+
+        drop(scope_ctx);
+        drop(scope_rt);
+        assert!(ctx.children().is_empty());
+    }
+
+    #[cfg(feature = "tokio")]
+    fn tokio_block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn stop_waits_for_spawned_tasks() {
+        let done = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        let task_done = done.clone();
+        tokio_block_on(async move {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+            ctx.spawn(async move {
+                let _ = rx.await;
+                task_done.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+            assert_eq!(ctx.task_count(), 1);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                let _ = tx.send(());
+            });
+            rt.stop().await.unwrap();
+        });
+        assert_eq!(done.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn stop_with_timeout_aborts_and_reports() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        let task_started = started.clone();
+        tokio_block_on(async move {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+            ctx.spawn(async move {
+                task_started.fetch_add(1, Ordering::SeqCst);
+                let _ = rx.await;
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+            std::mem::forget(tx);
+            let err = rt
+                .stop_with_timeout(std::time::Duration::from_millis(50))
+                .await
+                .unwrap_err();
+            match err.kind {
+                ErrorKind::Multiple(errors) => {
+                    assert_eq!(errors.len(), 1);
+                    assert!(matches!(
+                        errors[0].kind,
+                        ErrorKind::TaskAborted { task_id: 0 }
+                    ));
+                }
+                other => panic!("unexpected error kind: {other:?}"),
+            }
+        });
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn spawn_rejected_after_stop() {
+        tokio_block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            let ctx = rt.handle();
+            assert!(!ctx.is_stopping());
+            rt.stop().await.unwrap();
+            assert!(ctx.is_stopping());
+            let err = ctx.spawn(async { Ok::<(), Error>(()) }).unwrap_err();
+            assert!(matches!(err.kind, ErrorKind::Stopping));
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn spawn_without_runtime_context_fails() {
+        let rt = Builder::new().build().unwrap();
+        let ctx = rt.handle();
+        let err = ctx.spawn(async { Ok::<(), Error>(()) }).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::NoTaskRuntime));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn finished_tasks_are_pruned_from_registry() {
+        tokio_block_on(async {
+            let rt = Builder::new().build().unwrap();
+            let ctx = rt.handle();
+            ctx.spawn(async { Ok::<(), Error>(()) }).unwrap();
+            ctx.spawn(async { Ok::<(), Error>(()) }).unwrap();
+            for _ in 0..1000 {
+                if ctx.task_count() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(ctx.task_count(), 0);
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn task_failure_emits_task_failed_event() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let handler_observed = observed.clone();
+        tokio_block_on(async {
+            let mut builder = Builder::new();
+            builder
+                .on::<TaskFailed, _>(FnEventHandler(move |event: &TaskFailed, _: &Context| {
+                    handler_observed
+                        .lock()
+                        .unwrap()
+                        .push((event.task_id, matches!(event.error.kind, ErrorKind::Other)));
+                    Ok(EventControl::Continue)
+                }))
+                .unwrap();
+            let mut rt = builder.build().unwrap();
+            rt.start().await.unwrap();
+            let scope = rt.handle().scope().unwrap();
+            let mut scope_rt = scope.build().unwrap();
+            scope_rt
+                .handle()
+                .spawn(async { Err::<(), Error>(Error::new(Phase::Start, ErrorKind::Other)) })
+                .unwrap();
+            for _ in 0..1000 {
+                if !observed.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(*observed.lock().unwrap(), vec![(0, true)]);
+            scope_rt.stop().await.unwrap();
+            drop(scope_rt);
+            rt.stop().await.unwrap();
+        });
     }
 }

@@ -6,3 +6,14 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
+
+[features]
+default = ["tokio"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
+
+[[example]]
+name = "tasks"
+required-features = ["tokio"]

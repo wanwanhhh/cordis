@@ -3,7 +3,7 @@
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::{Error, ErrorKind, Phase};
 
@@ -23,10 +23,21 @@ trait ErasedFactory: Send + Sync {
 struct TypedFactory<T: Send + Sync + 'static> {
     factory: Box<dyn Fn() -> Result<T, Error> + Send + Sync>,
     value: OnceLock<T>,
+    init_lock: Mutex<()>,
 }
 
 impl<T: Send + Sync + 'static> TypedFactory<T> {
     fn get(&self) -> Result<&T, Error> {
+        if let Some(value) = self.value.get() {
+            return Ok(value);
+        }
+
+        // 串行化初始化：成功路径至多执行一次工厂，返回值始终是首个成功值。
+        // 锁跨工厂调用持有，要求工厂为非阻塞纯计算；失败保留可重试语义。
+        let _guard = self
+            .init_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(value) = self.value.get() {
             return Ok(value);
         }
@@ -149,6 +160,7 @@ impl ServiceRegistry {
             Box::new(TypedFactory {
                 factory: Box::new(factory),
                 value: OnceLock::new(),
+                init_lock: Mutex::new(()),
             }),
         );
         Ok(())
@@ -309,20 +321,41 @@ impl ServiceRegistry {
             })
     }
 
-    /// 返回当前所有已注册服务类型的集合（普通服务 + 工厂 + 集合）。
-    pub(crate) fn type_ids(&self) -> HashSet<TypeId> {
-        self.services
-            .keys()
-            .chain(self.factories.keys())
-            .chain(self.collections.keys())
-            .copied()
-            .collect()
+    /// 注册表回滚快照：记录键集合与各集合当前长度。
+    pub(crate) fn snapshot(&self) -> RegistrySnapshot {
+        RegistrySnapshot {
+            service_keys: self.services.keys().copied().collect(),
+            factory_keys: self.factories.keys().copied().collect(),
+            collection_lens: self
+                .collections
+                .iter()
+                .map(|(key, values)| (*key, values.len()))
+                .collect(),
+        }
     }
 
-    /// 仅保留指定 `TypeId` 集合中的服务。
-    pub(crate) fn retain(&mut self, keep: &HashSet<TypeId>) {
-        self.services.retain(|key, _| keep.contains(key));
-        self.factories.retain(|key, _| keep.contains(key));
-        self.collections.retain(|key, _| keep.contains(key));
+    /// 回滚到指定快照：删除快照外的键，并将既有集合截断回快照长度。
+    pub(crate) fn restore(&mut self, snapshot: RegistrySnapshot) {
+        let RegistrySnapshot {
+            service_keys,
+            factory_keys,
+            collection_lens,
+        } = snapshot;
+        self.services.retain(|key, _| service_keys.contains(key));
+        self.factories.retain(|key, _| factory_keys.contains(key));
+        self.collections
+            .retain(|key, _| collection_lens.contains_key(key));
+        for (key, len) in collection_lens {
+            if let Some(values) = self.collections.get_mut(&key) {
+                values.truncate(len);
+            }
+        }
     }
+}
+
+/// 服务注册表回滚快照。
+pub(crate) struct RegistrySnapshot {
+    service_keys: HashSet<TypeId>,
+    factory_keys: HashSet<TypeId>,
+    collection_lens: HashMap<TypeId, usize>,
 }

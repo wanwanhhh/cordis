@@ -28,8 +28,9 @@ src/
 
 2. **`Context` 只读**
    - `Context` 上没有 `provide` / `plugin` / `on` / `off` / `start` / `stop` / `require_mut`。
-   - `scope()` 是 `Context` 上唯一的构建入口，但它只递增父计数并返回新 `Builder`，不修改既有 `Data`。
-   - 所有写操作只存在于 `Builder` 或 `Configurator`。
+   - `scope()` 是 `Context` 上唯一的构建入口，但它只递增父计数并返回新 `Builder`，不修改既有服务注册表。
+   - `spawn()`（`tokio` feature）只登记后台任务到簿记注册表，不触碰冻结数据面。
+   - 所有服务/插件写操作只存在于 `Builder` 或 `Configurator`。
 
 3. **`Runtime` 不 Clone**
    - `Runtime` 是生命周期唯一所有者。
@@ -40,8 +41,8 @@ src/
    - 不用 `ManuallyDrop` 等绕开析构顺序的工具。
 
 5. **内部可变白名单**
-   - 只允许 `OnceLock`（懒工厂）、`Data.state: AtomicU64`（scope 计数/停止位）与 `DynamicValue` 服务内部的 `RwLock`。
-   - 不允许在 `Data` 本身放 `Mutex<Vec<...>>` 作为通用可变通道；运行期可变配置必须通过 `DynamicValue` 暴露。
+   - 只允许：`OnceLock` + `init_lock: Mutex<()>`（懒工厂串行初始化）、`Data.state: AtomicU64`（scope 计数/停止位）、`Data.children: Mutex<Vec<usize>>`（子作用域 id 注册表）、`Data.tasks`（`tokio` feature 任务注册表）、`DynamicValue` 服务内部的 `RwLock`。
+   - 白名单项只做框架生命周期簿记，不构成通用可变通道；运行期可变配置仍必须通过 `DynamicValue` 暴露。
 
 6. **租约字段序**
    - `ScopeLease` 必须是 `Runtime` 最后一个声明字段。
@@ -53,9 +54,11 @@ src/
 ## 3. 生命周期状态机
 
 - 仅当 `!started && !stopped` 时真正启动；`started || stopped` 时 `start` 为 no-op。
-- `ActiveScopes`（CAS 失败）不得置 `stopped`。
-- CAS 一旦成功，即使后续 plugin.stop / dispose 返回错误，`stopped` 仍保持 true；重复 `stop` 为 no-op。
+- `ActiveScopes`（CAS 失败）不得置 `stopped`，错误必须携带活跃子 id 清单。
+- CAS 一旦成功，即使后续 plugin.stop / drain / dispose 返回错误，`stopped` 仍保持 true；重复 `stop` 为 no-op。
 - 未 `start` 的 `stop` 只跑 dispose hooks，不调用插件 stop。
+- 任务排空发生在插件 stop 之后、dispose hooks 之前；`spawn` 在持有任务锁的临界区内检查 STOPPED 位，杜绝 stop/spawn 竞态。
+- `stop_with_timeout` 的预算为全部任务的总预算；超时任务 abort 后记 `TaskAborted`，不阻塞后续任务与 dispose。
 
 ---
 
@@ -119,5 +122,6 @@ cargo test --doc
   - `README.md`
   - `docs/architecture.md`
   - `docs/USAGE.md`
+- 新增对外行为特性需带可运行示例（或扩展示有示例）；`examples/` 被 `cargo test --all-targets` 编译验证，作为 USAGE.md 片段的编译基准，USAGE 对应小节需标注示例出处。
 - 删除旧 API 前确认无内部引用，且示例与测试全部迁移。
 - 不导出 `Data` / `PluginRecord` / `ScopeLease` 等内部实现类型。
