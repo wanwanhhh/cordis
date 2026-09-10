@@ -372,15 +372,29 @@ mod tests {
 
     #[test]
     fn runtime_require_keeps_factory_error_phase() {
+        // 工厂返回非 `ServiceNotFound`：phase 原样保留。
         let mut builder = Builder::new();
         builder
             .provide_factory::<u32>(|| Err(Error::new(Phase::Event, ErrorKind::Other)))
             .unwrap();
         let rt = builder.build().unwrap();
         let ctx = rt.handle();
-
-        // 工厂初始化失败不是「未命中」，其 phase 不得被重标成 Require。
         let err = ctx.require::<u32>().unwrap_err();
+        assert_eq!(err.phase, Phase::Event);
+
+        // 工厂自己抛 `ServiceNotFound`（透传）也不能被重标为 `Require`——判定依据
+        // 是「沿父链是否命中」，不是最终 kind。
+        let mut builder = Builder::new();
+        builder
+            .provide_factory::<u8>(|| {
+                Err(Error::new(
+                    Phase::Event,
+                    ErrorKind::ServiceNotFound("inner".to_string()),
+                ))
+            })
+            .unwrap();
+        let rt = builder.build().unwrap();
+        let err = rt.handle().require::<u8>().unwrap_err();
         assert_eq!(err.phase, Phase::Event);
     }
 

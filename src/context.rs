@@ -1028,9 +1028,6 @@ impl Builder {
             ));
         }
 
-        let deps = plugin.dependencies();
-        let plugin_deps = plugin.plugin_dependencies();
-
         // 重名检查放在求值依赖之前：重名时不必为两个 `Vec` 白白分配。
         if self.data.plugin_index.contains_key(name) {
             return Err(Error::new(
@@ -1038,6 +1035,9 @@ impl Builder {
                 ErrorKind::PluginNameAlreadyRegistered(name.to_string()),
             ));
         }
+
+        let deps = plugin.dependencies();
+        let plugin_deps = plugin.plugin_dependencies();
 
         let checkpoint = self.checkpoint();
 
@@ -1492,15 +1492,16 @@ impl Context {
 
     /// 获取服务引用。
     pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
-        // 只给「真正未命中」（`ServiceNotFound`）重标 `Require`；工厂初始化失败等
-        // 其他错误保留其原始 phase/kind，不被运行期查询语义覆盖。
-        self.inner.require().map_err(|err| {
-            if matches!(err.kind, ErrorKind::ServiceNotFound(_)) {
-                err.into_phase(Phase::Require, None)
-            } else {
-                err
-            }
-        })
+        // 用 `try_require` 区分「真正未命中」与「工厂失败」：`Ok(None)` 只可能是
+        // 沿整条父链都没找到，由这里构造 `Phase::Require` 的错误；工厂初始化失败
+        // 以 `Err` 透传，phase/kind 原样保留，不被运行期查询语义覆盖。
+        match self.inner.try_require::<T>()? {
+            Some(value) => Ok(value),
+            None => Err(Error::new(
+                Phase::Require,
+                ErrorKind::ServiceNotFound(std::any::type_name::<T>().to_string()),
+            )),
+        }
     }
 
     /// 判断服务是否存在（局部 + 父级）。
@@ -1644,7 +1645,10 @@ impl Context {
         // 路径可能立刻取到这个 cell 并调用 abort，空 `OnceLock` 会让取消变成静默
         // 无效。句柄本身随即丢弃——任务因此 detach，但完成信号与 abort 句柄已经
         // 足够管理它，不再需要 `JoinHandle`。
-        let _ = cell.abort.set(join.abort_handle());
+        if cell.abort.set(join.abort_handle()).is_err() {
+            // cell 刚创建、尚未发布，`abort` 只会被写入一次。
+            debug_assert!(false, "abort handle set exactly once before publish");
+        }
         drop(join);
         tasks.push(cell.clone());
 

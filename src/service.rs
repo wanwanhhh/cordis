@@ -81,8 +81,14 @@ pub(crate) type TypeMap<V> = HashMap<TypeId, V, BuildHasherDefault<TypeIdHasher>
 ///
 /// 插件名是编译期常量、没有不可信输入，默认 SipHash 的抗 DoS 属于白付；编译期
 /// 字符串键用 FNV-1a 更快（注册路径实测约快 15%）。
-#[derive(Default)]
 pub(crate) struct FnvHasher(u64);
+
+impl Default for FnvHasher {
+    fn default() -> Self {
+        // 直接以 FNV offset basis 起始，不用 0 作「未初始化」哨兵。
+        Self(Self::OFFSET)
+    }
+}
 
 impl FnvHasher {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -96,9 +102,6 @@ impl Hasher for FnvHasher {
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        if self.0 == 0 {
-            self.0 = Self::OFFSET;
-        }
         for &byte in bytes {
             self.0 ^= byte as u64;
             self.0 = self.0.wrapping_mul(Self::PRIME);
@@ -147,9 +150,11 @@ impl<T: Send + Sync + 'static> TypedFactory<T> {
         }
 
         let value = (self.factory)()?;
-        let _ = self.value.set(value);
-        // `set` 在 `init_lock` 下执行，紧接的 `get` 必有值。不变式被破坏说明本类型
-        // 自身有 bug，不该伪装成可恢复的业务错误。
+        if self.value.set(value).is_err() {
+            // 双检后槽位必为空，`set` 不可能失败；走到这里说明本类型内部不变式被
+            // 破坏，不该伪装成可恢复的业务错误。
+            debug_assert!(false, "factory value set under init_lock");
+        }
         Ok(self.value.get().expect("factory value set under init_lock"))
     }
 
