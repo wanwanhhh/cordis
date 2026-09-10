@@ -64,7 +64,7 @@ Built ──start──▶ Starting ──成功──▶ Running
 | `Stopped` | 终态 | no-op | 幂等 `Ok` |
 
 - `Failed` 与 `Running` **平行**，不是终态：失败后 `stop` 仍须回收已启动插件，`Stopped` 才是终态。
-- 调度计算失败（依赖图问题）停在 `Built`：一个插件都没进入启动流程，`stop` 无需回收。由于 `build()` 已校验依赖图，该分支是防御性的。
+- 调度在 `build()`（`validate()`）算好后随 `Runtime` 保存，`start` 不再有调度失败分支：依赖图问题在 `build()` 就以 `Err` 返回，根本产生不出 `Runtime`。
 - **中途丢弃 start future 会停在 `Starting`**：部分插件已启动、流程未完成。重入 `start()` 返回 `ErrorKind::StartFailed`（不带 `source`）而非 `Ok`。不续跑——部分启动的状态不该被「接着启动」，调用方应 `stop` 回收后重建。
 - **`stop` 可续跑**：插件与 dispose 的进度记在 `StopProgress` 游标里，三者都只在对应 `await` 真正返回后才推进。中途丢弃 stop future 会停在 `Stopping`，下次 `stop()` 从断点继续；正在处理的项会被重试，不漏项也不报成功。代价是插件 `stop` 需要能吃下一次中断后重入。
 - 任务排空同样 at-least-once，但**不再需要把在飞句柄挂在 `Runtime` 上**：任务表的元素是与 `TaskHandle` 共享的 `Arc<TaskCell>`，「先 await 完成信号、再取出」使得被丢弃的 future 不会摘走任何表项，重入重新处理同一个 cell（见 3.5）。旧实现必须把 `JoinHandle` 存进 `Runtime.draining`，否则局部句柄析构会 detach 任务、重入误判「已排空」。
@@ -100,7 +100,7 @@ let child: Builder = ctx.scope()?;
 - 租约在 `Context::scope()` 时交给子 `Builder`，`build()` 时 move 给子 `Runtime`。
 - 只在 `Runtime` / `Builder` 的字段析构阶段释放，绝不在 `stop()` 成功路径释放。
 - `Runtime` 中 `_lease` 必须是最后一个字段，保证插件字段先析构、再归还父计数。
-- `ScopeLease::drop` 先把本层 id 从父注册表摘除，再 `fetch_sub(1, SeqCst)` 归还父计数。
+- `ScopeLease::drop` 先把本层 id 从父注册表摘除，再由 `Gate::release_lease` 在锁内 `-= 1` 归还父计数。
 - **计数与生命周期状态共用父 `Gate` 的同一把锁**。这不是编码风格问题：`Context::scope()` 的「确认未停止 + 租约加一」与 `Runtime::stop` 的「确认租约为零 + 转入 `Stopping`」必须在同一临界区判定，拆成两个独立原子会在两步之间裂开竞态——父停止的同时长出子作用域。（早期实现用单个 `AtomicU64` 位打包 + 一次 CAS，现已改为互斥锁；`scope` / `stop` 都是低频路径，热路径仍是单原子读。）
 
 ### 3.3 父 stop 与子存活
@@ -126,10 +126,10 @@ let child: Builder = ctx.scope()?;
 - **必须电平触发**：`poll` 先查标志、已置位即 `Ready`，否则入列；置位与唤醒在锁内完成，`poll` 的「复查 + 入列」也在同一把锁下，因此不存在「先查后注册」的丢唤醒窗口。边沿触发做不到这点——停止可能在任何等待者注册之前就已发生。
 - **注册项按「哪个 future 注册的」区分，而不是按 waker 相等**：`Signal` 里每个条目是 `(token, Waker)`，`poll` 按 token 更新/新增（同一个 future 被反复 poll 只更新 waker，所以列表长度 = 活着的等待 future 数）。按 waker 判重是个陷阱——同一任务里的两个 `cancelled()` 等待者由 executor 用同一个 waker 轮询，会共享一条记录，其中一个 future 被丢弃时就把另一个仍然存活的等待者的唤醒源一起摘掉，停止时无人被唤醒。
 - **等待者会在放弃等待时主动摘除自己**：`cancelled()` 返回的 future 在 `Drop` 里按自己的 token 调 `Signal::unregister`。等待者常写成 `select! { _ = ctx.cancelled() => …, _ = work => … }`，先等到 `work` 就不再关心停止信号；不摘除的话，长生命周期作用域的等待者列表会随这类任务单调增长。
-- 排空与 `TaskHandle::wait` 走 `Signal::wait`，每次调用分配一个 token 且不注销：它们的生命周期绑定在短命的 `TaskCell` 上，残项在 `fire` 时整体清空，不构成无界增长。
+- 排空与 `TaskHandle::wait` 走 `Signal::wait`，其 future 被丢弃时会在 `Drop` 里注销自己的注册项（`Waiting::drop`）；信号触发时列表整体清空。
 - 不依赖 tokio：`poll` 只用 `std::task::{Poll, Waker}`，`cancelled()` 可在任意 executor 上等待。
-- **触发时机是硬不变量**：`enter_stopping()` 的 CAS 成功后立刻广播，必须早于插件 `stop` 与任务排空。否则长驻任务收到信号时排空已经在等它，「优雅收尾」就没有窗口。
-- `poll_cancelled` 额外复查生命周期状态——这是一个**免锁快路径**（已进入停止的等待者不必抢 `Signal` 的锁），不是正确性所必需：`fire` 总会唤醒已注册的等待者，而 CAS 与 `fire` 之间到达的等待者会在 `fire` 的锁内被 drain。
+- **触发时机是硬不变量**：`Gate::enter_stopping` 转入 `Stopping`（并在锁内置 `stopping` 闩）后立刻广播，必须早于插件 `stop` 与任务排空。否则长驻任务收到信号时排空已经在等它，「优雅收尾」就没有窗口。
+- `poll_cancelled` 额外复查 `stopping` 闩——这是一个**免锁快路径**（已进入停止的等待者不必抢 `Signal` 的锁），不是正确性所必需：`fire` 总会唤醒已注册的等待者，而转入 `Stopping` 与 `fire` 之间到达的等待者会在 `fire` 的锁内被 drain。
 - `StopHandle::request_stop()` 是第二个触发点：置请求位（`stop_requested`，与生命周期状态**分开**）后广播。请求不改变 `is_stopping`，也不拒绝 `scope` / `spawn`——请求不是清理。
 
 ### 3.5 后台任务（`tokio` feature）
@@ -143,7 +143,7 @@ let child: Builder = ctx.scope()?;
 - **完成信号必须有写者，而且要覆盖整个任务**：`catch_unwind` 只兜住任务体；结局的**上报路径**（`emit_notify` 会跑用户 handler）与任务体同在一个任务里，它 panic 时 wrapper 会在写结局之前展开——没有兜底则完成信号永不触发，`stop()` 与 `TaskHandle::wait` 一起挂死，`stop_with_timeout` 还会把 panic 误报成 `TaskAborted`。因此另有 `FinishOnUnwind` 守卫按成因兜底：正在展开（真 panic）记 `Panicked`，宿主直接把 future 丢掉（runtime 关闭、未记录的 abort）记取消——后者若也记 panic，会让一次 `stop()` 凭空多出 `TaskFailed` 假失败。两种情况都必须触发完成信号，否则排空会等一个永远不来的信号。panic hook 照常输出。
 - 剪除（`spawn` 里阈值触发的 `retain`）只回收「不需要排空上报」的结局，`needs_drain_report` 是唯一出处：`Panicked`（无事件出口）与 `AbortedByTimeout`（只有排空上报）必须留在表里。代价是**未被 `stop` 清理前，表里会累积 panic 过的 cell**（每个很小）；上游应当在监控里用 `TaskFailed` 事件而不是依赖 `stop` 报错来发现任务 panic。
 - `Context::task_count()` 统计尚未落定结局的任务，含 `stop` 正在排空的那一个。
-- `stop` 顺序：CAS 转入 `Stopping` 并广播取消 → 插件逆序 `stop` → 排空任务（`stop_with_timeout` 预算内等待，超时 `abort` 并上报 `ErrorKind::TaskAborted`）→ dispose hooks。
+- `stop` 顺序：转入 `Stopping` 并广播取消 → 插件逆序 `stop` → 排空任务（`stop_with_timeout` 预算内等待，超时 `abort` 并上报 `ErrorKind::TaskAborted`）→ dispose hooks。
 - **取消来源写进结局本身**：`TaskOutcome` 区分 `AbortedByOwner` 与 `AbortedByTimeout`。owner 通过 `TaskHandle::abort()` 的取消不计入停止错误（否则「我让你停」会被报成失败），只有排空预算耗尽的取消才上报 `TaskAborted`。两者用同一个 `Mutex<Option<TaskOutcome>>` 的「先写者胜」落定，因此排空只读一次结局就能正确归类——分成「结局 + 旁边一个来源原子」会留下「结局已是取消、来源标记还没写入」的窗口，把 owner 取消误报成超时。取消方负责补发完成信号：被 abort 的任务不会再执行收尾代码。owner `abort` 与排空超时**真正同刻**并发时按「先写者胜」归类——先落定的一方定义这次取消的性质，这是可接受的平局语义，但值得知道它存在。
 - 排空「先 await 结局、再取出」：await 被取消时不摘表，重入重新看到它；「取出—判断—上报」之间没有 await 点，因此相对取消是原子的——被丢弃的 stop future 只会停在 await 上，不会落在中间造成漏报或重报，无需额外的去重标志。
 - abort 尽力而为：卡在阻塞调用里的任务要等其让出执行权才会真正取消。
@@ -249,7 +249,7 @@ pub struct Error {
 
 ```rust
 pub enum Phase {
-    Apply, Verify, Build, Start, Ready, Stop, Dispose, Event,
+    Apply, Verify, Build, Require, Start, Ready, Stop, Dispose, Event,
 }
 
 pub enum ErrorKind {

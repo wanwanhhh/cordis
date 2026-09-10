@@ -2,7 +2,7 @@
 
 use std::any::TypeId;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -18,7 +18,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 
 use crate::event::{ErasedEventHandler, Subscription, TypedEventHandler};
-use crate::service::TypeMap;
+use crate::service::{NameMap, TypeMap};
 use crate::{
     DynamicValue, Error, ErrorKind, Event, EventControl, EventHandler, Phase, Plugin, PluginScope,
     ServiceRegistry,
@@ -371,7 +371,7 @@ struct Data {
     parent: Option<Arc<Data>>,
     services: ServiceRegistry,
     /// 插件名 -> `plugins` 索引。注册期查重与调度共用这一份索引。
-    plugin_index: HashMap<&'static str, usize>,
+    plugin_index: NameMap<usize>,
     /// 装配阶段的可变 handler 列表；`build` 时按事件类型分组进 `handlers_by_type`。
     event_handlers: Vec<Arc<dyn ErasedEventHandler>>,
     /// 冻结后的按事件类型分组表：emit 直接查表，避免每次全表扫描。
@@ -451,6 +451,29 @@ enum TaskOutcome {
     AbortedByTimeout,
 }
 
+/// `TaskOutcome` 的判别式视图。用于只判类别、不取错误内容的热路径（剪除扫描、
+/// 排空归类），避免克隆可能很深（`ErrorKind::Multiple`）的 `Error`。
+#[cfg(feature = "tokio")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskOutcomeKind {
+    Completed,
+    Panicked,
+    AbortedByOwner,
+    AbortedByTimeout,
+}
+
+#[cfg(feature = "tokio")]
+impl TaskOutcome {
+    fn kind(&self) -> TaskOutcomeKind {
+        match self {
+            Self::Completed(_) => TaskOutcomeKind::Completed,
+            Self::Panicked => TaskOutcomeKind::Panicked,
+            Self::AbortedByOwner => TaskOutcomeKind::AbortedByOwner,
+            Self::AbortedByTimeout => TaskOutcomeKind::AbortedByTimeout,
+        }
+    }
+}
+
 #[cfg(feature = "tokio")]
 impl TaskCell {
     fn is_finished(&self) -> bool {
@@ -524,6 +547,15 @@ impl TaskCell {
             .expect("finished implies outcome written")
     }
 
+    /// 只读取结局类别，不克隆 `Error`；供剪除扫描与排空归类使用。
+    fn outcome_kind(&self) -> Option<TaskOutcomeKind> {
+        self.outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(TaskOutcome::kind)
+    }
+
     /// 是否有「排空必须上报、但还没上报」的结局。
     ///
     /// 两个来源：panic（没有事件出口）与排空超时取消（只有排空上报）。`spawn` 的
@@ -532,8 +564,8 @@ impl TaskCell {
     /// owner 取消按语义不上报，二者都不在此列。
     fn needs_drain_report(&self) -> bool {
         matches!(
-            self.peek_outcome(),
-            Some(TaskOutcome::Panicked | TaskOutcome::AbortedByTimeout)
+            self.outcome_kind(),
+            Some(TaskOutcomeKind::Panicked | TaskOutcomeKind::AbortedByTimeout)
         )
     }
 }
@@ -580,7 +612,7 @@ impl Data {
             context_id: NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed),
             parent,
             services: ServiceRegistry::new(),
-            plugin_index: HashMap::new(),
+            plugin_index: NameMap::default(),
             event_handlers: Vec::new(),
             handlers_by_type: TypeMap::default(),
             next_subscription_id: 0,
@@ -773,7 +805,7 @@ struct Schedule {
 /// 环检测只在 Kahn 贪心选点阶段发生一次。
 fn compute_schedule(
     plugins: &[PluginRecord],
-    local_index: &HashMap<&'static str, usize>,
+    local_index: &NameMap<usize>,
     has_plugin: impl Fn(&str) -> bool,
 ) -> Result<Schedule, Error> {
     let n = plugins.len();
@@ -999,6 +1031,7 @@ impl Builder {
         let deps = plugin.dependencies();
         let plugin_deps = plugin.plugin_dependencies();
 
+        // 重名检查放在求值依赖之前：重名时不必为两个 `Vec` 白白分配。
         if self.data.plugin_index.contains_key(name) {
             return Err(Error::new(
                 Phase::Build,
@@ -1055,21 +1088,33 @@ impl Builder {
     /// 注册插件并注入配置。
     ///
     /// 配置会以 `C` 类型作为当前 Builder 的服务注入；插件可通过 `require::<C>()` 读取。
-    /// 如果插件 `apply` 失败，配置服务也会一起回滚。
+    /// 插件 `apply` 失败（返回 `Err` 或 panic 展开）时，配置服务也会一起回滚。
     pub fn plugin_with_config<P, C>(&mut self, plugin: P, config: C) -> Result<(), Error>
     where
         P: Plugin,
         C: Send + Sync + 'static,
     {
         let checkpoint = self.checkpoint();
-        self.provide(config)?;
 
-        if let Err(err) = self.plugin(plugin) {
-            self.rollback(checkpoint);
-            return Err(err);
+        // 配置注入与插件装载必须同属一个事务：`plugin()` 内部的 `catch_unwind` 只会
+        // 回滚到它自己的检查点（在 `provide(config)` 之后），因此配置的 panic 回滚
+        // 必须由这里统一负责，否则 `apply` panic 会留下注入的配置服务。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.provide(config)?;
+            self.plugin(plugin)
+        }));
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => {
+                self.rollback(checkpoint);
+                Err(err)
+            }
+            Err(payload) => {
+                self.rollback(checkpoint);
+                std::panic::resume_unwind(payload);
+            }
         }
-
-        Ok(())
     }
 
     /// 注册服务。
@@ -1412,7 +1457,7 @@ pub struct Context {
 impl Context {
     /// 创建一个子 Builder。
     ///
-    /// 该方法会在父 `Data.state` 上原子的递增 child 计数；若父已进入停止，
+    /// 该方法会在父 `Gate` 的临界区内登记一个子作用域租约；若父已进入停止，
     /// 返回 `ErrorKind::Stopping`。
     pub fn scope(&self) -> Result<Builder, Error> {
         if self.inner.gate.acquire_lease() {
@@ -1447,10 +1492,15 @@ impl Context {
 
     /// 获取服务引用。
     pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
-        // 运行期查询失败与装配期注册错误区分开，见 `Phase::Require`。
-        self.inner
-            .require()
-            .map_err(|err| err.into_phase(Phase::Require, None))
+        // 只给「真正未命中」（`ServiceNotFound`）重标 `Require`；工厂初始化失败等
+        // 其他错误保留其原始 phase/kind，不被运行期查询语义覆盖。
+        self.inner.require().map_err(|err| {
+            if matches!(err.kind, ErrorKind::ServiceNotFound(_)) {
+                err.into_phase(Phase::Require, None)
+            } else {
+                err
+            }
+        })
     }
 
     /// 判断服务是否存在（局部 + 父级）。
@@ -1695,19 +1745,20 @@ impl Context {
     }
 
     async fn emit_impl<E: Event>(&self, event: E, parallel: bool, notify: bool) -> Vec<Error> {
-        let mut current = Some(self.inner.clone());
+        // 沿父链借用推进，不做任何 `Arc` 克隆；只有真正要构造 `Context` 交给
+        // handler 的那一层才 clone 一次。
+        let mut current: Option<&Arc<Data>> = Some(&self.inner);
         let mut all_errors = Vec::new();
 
         while let Some(inner) = current {
             let handlers = inner.event_handlers_for::<E>();
             if handlers.is_empty() {
-                // 绝大多数层没有该事件类型的 handler。先跳过空层，省掉为构造
-                // 一个不会被使用的 `Context` 而做的 `Arc` 计数增减。
-                current = inner.parent.clone();
+                // 绝大多数层没有该事件类型的 handler，直接跳过。
+                current = inner.parent.as_ref();
                 continue;
             }
             let ctx = Context {
-                inner: inner.clone(),
+                inner: Arc::clone(inner),
             };
 
             let mut layer_errors = Vec::new();
@@ -1763,7 +1814,7 @@ impl Context {
                 return all_errors;
             }
 
-            current = inner.parent.clone();
+            current = inner.parent.as_ref();
         }
 
         all_errors
@@ -1896,8 +1947,8 @@ struct StopProgress {
 
 /// 生命周期唯一所有者；不 `Clone`，`#[must_use]`。
 ///
-/// 生命周期状态不存在本地副本：真值源是 `Data.state` 的同一个原子字（与子
-/// 作用域租约计数共享）。本地 bool 镜像一旦存在，就会在状态被 owner 之外的
+/// 生命周期状态不存在本地副本：真值源是 `Gate` 里 `Mutex<GateState>` 保护的
+/// `{ lifecycle, leases }`。本地 bool 镜像一旦存在，就会在状态被 owner 之外的
 /// 路径推进时变成陈旧值——那正是「启动失败被记成已启动」的同一形态。
 #[must_use]
 pub struct Runtime {
@@ -1942,15 +1993,12 @@ impl Runtime {
         }
     }
 
-    /// 当前生命周期状态。真值源是 `Data.state`，本地不保留副本。
+    /// 当前生命周期状态。真值源是 `Gate`，本地不保留副本。
     fn lifecycle(&self) -> Lifecycle {
         self.ctx.inner.gate.lifecycle()
     }
 
-    /// 只替换状态位，保留子作用域租约计数。
-    ///
-    /// 用 `fetch_update` 而非 `store`：计数会被 `Context::scope()` 与
-    /// `ScopeLease::drop` 并发修改，读改写必须循环 CAS，否则丢更新。
+    /// 更新生命周期状态（`Gate` 在锁内同时处理 `stopping` 单向闩）。
     fn set_lifecycle(&self, next: Lifecycle) {
         self.ctx.inner.gate.set_lifecycle(next);
     }
@@ -2161,10 +2209,7 @@ impl Runtime {
         }
     }
 
-    /// 转入 `Stopping`：一次 CAS 完成「确认无活跃子作用域 + 状态迁移」。
-    ///
-    /// 期望值必须是从 `state` 读出的**完整快照**（状态位 + 计数位），不能沿用
-    /// 常量 `0`——状态位落地后 `0` 只表示 `Built` 且无子作用域。
+    /// 转入 `Stopping`：在 `Gate` 的临界区内一次完成「确认无活跃子作用域 + 状态迁移」。
     fn enter_stopping(&mut self) -> Result<(), Error> {
         match self.ctx.inner.gate.enter_stopping() {
             Ok(()) => {
@@ -2235,19 +2280,22 @@ impl Runtime {
             // 从这里到本次循环结束没有 await 点，因此「取出 - 判断 - 上报」相对
             // 取消是原子的：被丢弃的 stop future 不会停在这中间造成漏报或重报。
             // 取消来源直接取自结局本身，不需要额外的旁路状态。
-            match cell.outcome() {
+            match cell
+                .outcome_kind()
+                .expect("finished implies outcome written")
+            {
                 // owner 主动取消不是失败，不计入停止错误。
-                TaskOutcome::AbortedByOwner => {}
+                TaskOutcomeKind::AbortedByOwner => {}
                 // 任务体返回的错误已在完成时通过 `TaskFailed` 事件上报过一次，
                 // 排空不重复上报。
-                TaskOutcome::Completed(_) => {}
-                TaskOutcome::AbortedByTimeout => {
+                TaskOutcomeKind::Completed => {}
+                TaskOutcomeKind::AbortedByTimeout => {
                     self.stop_errors.push(Error::new(
                         Phase::Stop,
                         ErrorKind::TaskAborted { task_id: id },
                     ));
                 }
-                TaskOutcome::Panicked => {
+                TaskOutcomeKind::Panicked => {
                     self.stop_errors.push(Error::new(
                         Phase::Stop,
                         ErrorKind::TaskFailed { task_id: id },

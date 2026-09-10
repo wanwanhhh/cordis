@@ -451,7 +451,7 @@ agent_rt.start().await?;
 
 ### 5.1 c-lite 租约
 
-「c-lite」指本框架采用的轻量租约计数模型：子作用域的存活以父级一个原子计数表示，父级停止时只检查这个计数。父 `Runtime::stop()` 会检查本层活跃子 `Builder` / `Runtime`：
+「c-lite」指本框架采用的轻量租约计数模型：子作用域的存活以父级 `Gate` 里的一个租约计数表示，父级停止时只检查这个计数。父 `Runtime::stop()` 会检查本层活跃子 `Builder` / `Runtime`：
 
 ```rust
 let child_builder = ctx.scope()?;
@@ -860,15 +860,14 @@ ErrorKind::Multiple
 ```
 
 - 事件并行派发聚合错误使用 `Phase::Event` + `ErrorKind::Multiple`
-- `start()` 失败 fail-fast，并进入失败态：插件 / ready 阶段的首次失败按原样返回 `ErrorKind::Multiple`，同时可由 `Runtime::start_error()` 查回（`Error` 可 `Clone`，两份共享同一条错误链）；调度计算失败是例外——它原样返回单点错误且停在 `Built`
+- `start()` 失败 fail-fast，并进入失败态：插件 / ready 阶段的首次失败按原样返回 `ErrorKind::Multiple`，同时可由 `Runtime::start_error()` 查回（`Error` 可 `Clone`，两份共享同一条错误链）。依赖图问题（缺失依赖 / 环）在 `build()` 阶段就以 `Err` 返回，因此不存在「已 build 成功却在 `start` 时调度失败」的 Runtime
 - 失败后重入 `start()` 返回 `ErrorKind::StartFailed`，**不再静默返回 `Ok`**，根因挂在 `source` 链上；插件不会被再次启动，`stop()` 仍可回收已启动插件
 - 上一次 `start` 被中途丢弃（future 取消）会停在未完成态，重入同样返回 `ErrorKind::StartFailed`，此时没有 `source`
 - `stop()` 可续跑：中途丢弃 stop future 后重入会从断点继续，不报假成功；因此插件 `stop` 应能承受一次中断后重入
 - `stop()` 失败会继续清理并聚合为 `ErrorKind::Multiple`
 - `start-after-stop` 是 no-op：Runtime 停止后不会再次启动插件
 - `start()` 返回 `Ok` 只表示「运行时不再需要启动」——`Running` 是幂等 no-op，`Stopping`/`Stopped` 是停止后的 no-op；**它不等于本次调用完成了启动**。只有启动尝试本身出问题才返回 `Err`（见上两条）
-- 调度失败（依赖图问题）停在未启动态：`stop` 不调用任何插件 `stop`，只执行 dispose hooks
-- 未 `start` 就 `stop` 时只执行 dispose hooks，不调用插件自身的 `stop`
+- 未 `start` 就 `stop` 时只执行 dispose hooks，不调用插件自身的 `stop`（`build()` 成功后从未启动的 Runtime 属于这一类）
 - `stop()` 幂等：已停止的 `Runtime` 再次 `stop` 直接返回 `Ok`
 - 被 `ActiveScopes` 拒绝的 `stop()` **不进入 stopped 状态**：子作用域照常工作，`ids` 定位阻塞方，清理完子 `Builder` / `Runtime` 后可重试停止
 - `ErrorKind::Stopping` 同时覆盖停止后的 `scope()` 与 `spawn()` 拒绝

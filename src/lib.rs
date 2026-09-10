@@ -335,6 +335,56 @@ mod tests {
     }
 
     #[test]
+    fn plugin_with_config_panic_rolls_back_config() {
+        struct Marker;
+        struct Cfg;
+
+        struct BoomWithCfg;
+
+        #[async_trait]
+        impl Plugin for BoomWithCfg {
+            fn name(&self) -> &'static str {
+                "boom-with-cfg"
+            }
+
+            fn apply(&self, _cfg: &mut Configurator<'_>) -> Result<(), Error> {
+                panic!("config plugin exploded");
+            }
+        }
+
+        let mut builder = Builder::new();
+        builder.provide(Marker).unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            builder.plugin_with_config(BoomWithCfg, Cfg)
+        }));
+        assert!(result.is_err(), "panic 必须原样向上传播");
+
+        // 配置注入与插件装载同属一个事务：两者都必须回滚。
+        assert!(!builder.contains::<Cfg>());
+        assert!(!builder.has_plugin("boom-with-cfg"));
+        assert!(builder.contains::<Marker>());
+
+        let mut rt = builder.build().unwrap();
+        block_on(rt.start()).unwrap();
+        block_on(rt.stop()).unwrap();
+    }
+
+    #[test]
+    fn runtime_require_keeps_factory_error_phase() {
+        let mut builder = Builder::new();
+        builder
+            .provide_factory::<u32>(|| Err(Error::new(Phase::Event, ErrorKind::Other)))
+            .unwrap();
+        let rt = builder.build().unwrap();
+        let ctx = rt.handle();
+
+        // 工厂初始化失败不是「未命中」，其 phase 不得被重标成 Require。
+        let err = ctx.require::<u32>().unwrap_err();
+        assert_eq!(err.phase, Phase::Event);
+    }
+
+    #[test]
     fn stop_continues_and_dispose_hook_always_runs() {
         let observed = Arc::new(Mutex::new(Vec::new()));
 

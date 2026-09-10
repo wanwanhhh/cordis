@@ -74,7 +74,7 @@ fn main() -> Result<(), Error> {
 - 插件元信息 / 优先级
 - `Configurator` 窄接口与 `apply` 失败回滚
 - 异步 ready / dispose 生命周期
-- 生命周期为显式状态机（`Built` / `Starting` / `Running` / `Failed` / `Stopping` / `Stopped`），与子作用域租约计数共用同一原子字
+- 生命周期为显式状态机（`Built` / `Starting` / `Running` / `Failed` / `Stopping` / `Stopped`），与子作用域租约计数由 `Gate`（`Mutex` 保护的 `{ lifecycle, leases }` + `AtomicBool` 单向闩）统一管理
 - 启动失败 fail-fast；失败后进入失败态，重入 `start` 返回 `StartFailed`（不再静默成功），根因可由 `Runtime::start_error()` 查回
 - 停止失败继续清理
 - `stop` 可续跑：中途丢弃 stop future 后重入从断点继续，不谎报成功
@@ -111,6 +111,9 @@ fn main() -> Result<(), Error> {
 - `ErrorKind::ServiceTypeMismatch { expected, found }`：**删除**。服务与工厂只存在于泛型 `provide*` 插入路径，键与值的类型由 `TypeId` 保证一致，这个变体不可能被构造；取出时的 `downcast` 失败改为内部不变式 `expect`（真出错会明确 panic，而不是伪装成可恢复的服务错误）。
 - `ErrorKind::StartFailed`：新增变体。`start()` 在**启动失败**后重入时返回它，失败根因挂在 `source` 链上；在**被中断**（start future 被丢弃）后重入同样返回它，但没有 `source`。旧行为是两种情况都静默返回 `Ok` 且不启动任何插件。对 `ErrorKind` 做穷尽匹配的代码需补分支。
 - `ErrorKind::ActiveScopes { count, ids }`：新增 `ids` 字段（活跃子作用域 id 清单）。旧代码的模式匹配需补 `..` 或 `ids` 绑定。
+- `Phase::Require`：新增变体。运行期 `Context::require` 未命中时返回它；装配期 `Builder::require` 仍是 `Phase::Build`。对 `Phase` 做穷尽匹配的代码需补分支。
+- `ErrorKind::TooManyScopes`：**删除**。作用域租约计数是 `usize`，不存在可实际触及的上限，该变体已不可构造。
+- `Configurator` / `Builder` 的 `apply` 失败回滚由整表快照改为增量撤销日志；`plugin_with_config` 现在对 `apply` panic 也会回滚注入的配置服务。
 
 自本版起生效；0.x 阶段该类型不做向后兼容承诺。
 
