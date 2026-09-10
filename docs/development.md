@@ -27,9 +27,10 @@ src/
    - 冻结后不存在框架可见的 `&mut Data` 路径。
 
 2. **`Context` 只读**
-   - `Context` 上没有 `provide` / `plugin` / `on` / `off` / `start` / `stop` / `require_mut`。
+   - `Context` 上没有 `provide` / `plugin` / `on` / `off` / `start` / `stop` / `require_mut` / `request_stop`。
    - `scope()` 是 `Context` 上唯一的构建入口，但它只递增父计数并返回新 `Builder`，不修改既有服务注册表。
    - `spawn()`（`tokio` feature）只登记后台任务到簿记注册表，不触碰冻结数据面。
+   - 停止**请求**不放在 `Context` 上：`request_stop` 只存在于 `Runtime::stop_handle()` 显式授出的 `StopHandle`，避免每个插件都获得环境权限。
    - 所有服务/插件写操作只存在于 `Builder` 或 `Configurator`。
 
 3. **`Runtime` 不 Clone**
@@ -41,7 +42,7 @@ src/
    - 不用 `ManuallyDrop` 等绕开析构顺序的工具。
 
 5. **内部可变白名单**
-   - 只允许：`OnceLock` + `init_lock: Mutex<()>`（懒工厂串行初始化）、`Data.state: AtomicU64`（scope 计数/停止位）、`Data.children: Mutex<Vec<usize>>`（子作用域 id 注册表）、`Data.tasks`（`tokio` feature 任务注册表）、`DynamicValue` 服务内部的 `RwLock`。
+   - 只允许：`OnceLock` + `init_lock: Mutex<()>`（懒工厂串行初始化）、`Data.state: AtomicU64`（生命周期状态位 + 子作用域租约计数）、`Data.children: Mutex<Vec<usize>>`（子作用域 id 注册表）、`Signal`（`AtomicBool` + `Mutex<Vec<Waiter>>`，`Waiter { token, waker }`；用于 `Data.cancellation` 与 `TaskCell.finished`）、`Data.stop_requested: AtomicBool`、`Data.tasks`（`tokio` feature 任务注册表，元素为 `Arc<TaskCell>`，cell 内为 `OnceLock<AbortHandle>` + `Signal` + `Mutex<Option<TaskOutcome>>`）、`DynamicValue` 服务内部的 `RwLock`、以及三个计数器 `static NEXT_CONTEXT_ID: AtomicUsize`、`TaskRegistry.next_id: AtomicU64` 与 `static NEXT_WAITER_TOKEN: AtomicU64`（只用于区分取消等待者的注册项）。
    - 白名单项只做框架生命周期簿记，不构成通用可变通道；运行期可变配置仍必须通过 `DynamicValue` 暴露。
 
 6. **租约字段序**
@@ -53,12 +54,29 @@ src/
 
 ## 3. 生命周期状态机
 
-- 仅当 `!started && !stopped` 时真正启动；`started || stopped` 时 `start` 为 no-op。
-- `ActiveScopes`（CAS 失败）不得置 `stopped`，错误必须携带活跃子 id 清单。
-- CAS 一旦成功，即使后续 plugin.stop / drain / dispose 返回错误，`stopped` 仍保持 true；重复 `stop` 为 no-op。
-- 未 `start` 的 `stop` 只跑 dispose hooks，不调用插件 stop。
-- 任务排空发生在插件 stop 之后、dispose hooks 之前；`spawn` 在持有任务锁的临界区内检查 STOPPED 位，杜绝 stop/spawn 竞态。
-- `stop_with_timeout` 的预算为全部任务的总预算；超时任务 abort 后记 `TaskAborted`，不阻塞后续任务与 dispose。
+生命周期状态**没有本地副本**，唯一真值源是 `Data.state` 的同一个 `AtomicU64`：低 60 位是子作用域租约计数，高 4 位是 `Lifecycle` 状态。两者必须同字——`Context::scope()` 的「检查未停止 + 计数加一」与 `Runtime::stop` 的「确认计数为零 + 转入 `Stopping`」都必须是**一次** CAS，拆成两个字段会在两步之间裂开竞态。
+
+6 个状态与完整转换表见 `docs/architecture.md` §2.1。此处只列维护者必须守住的不变量：
+
+- 状态只由 `&mut self` 的 `start_with` / `stop_impl` 推进（`Runtime` 不 `Clone`，不存在 owner 之外的写者）。
+- `Built` / `Starting` / `Running` / `Failed` 可直接进入 `Stopping`；`Stopping` 是唯一可续跑的清理进行态；`Stopped` 是终态。
+- `Failed` 与 `Running` **平行**，不是终态：失败后 `stop` 仍须回收已进入启动流程的插件。`Stopped` 只在插件 `stop`、任务排空、dispose 全部走完之后落地。
+- `ActiveScopes`（CAS 失败）**不得改动状态**，错误必须携带活跃子 id 清单；调用方清理完子 `Builder` / `Runtime` 后可重试。
+- `start` 重入语义：`Running` 幂等 no-op；`Failed` 返回带 `source` 的 `StartFailed`；`Starting`（start future 被取消）返回不带 `source` 的 `StartFailed`；`Stopping` / `Stopped` 返回 `Ok`——`Ok` 只表示「不再需要启动」，不等于本次调用完成了启动。
+- 未 `start` 的 `stop` 只跑 dispose hooks，不调用插件 stop（`StopProgress.plugins` 初值为 0）。
+- **清理必须可续跑**：`StopProgress` 两个游标与累积错误（`Runtime.stop_errors`）只在对应 `await` 返回后推进/写回，并跨重入保留。任何「先推进游标再 `await`」的写法都会重新引入丢项或假成功。
+- 任务排空同样 at-least-once，但**不把在飞句柄挂在 `Runtime` 上**：表元素是与 `TaskHandle` 共享的 `Arc<TaskCell>`，「先 await 完成信号、再取出」使被丢弃的 future 不摘走任何表项，重入重新处理同一个 cell（完成信号电平触发，已结束的立即返回）。「取出—判断—上报」之间不得插入 `await`，否则取消会落进中间造成漏报——这条不变量同时承担去重：被丢弃的 future 只可能停在 await 上，因此不存在「已上报的 cell 又回到表里」的情形，不需要额外的去重标志。
+- **`spawn` 的剪除必须保住「排空仍需上报」的结局**：按 `is_finished()` 盲删会让一条 panic 因为它之后又有人 `spawn` 过而被静默丢掉。`TaskCell::needs_drain_report` 是这条判断的唯一出处（覆盖 `Panicked` 与 `AbortedByTimeout`；后者是防御性的——它总在同一轮被取出，当前不可观测，但让谓词不依赖调用点位置）。
+- **进入关闭流程立刻广播取消**（`Signal::fire`），顺序是：CAS 到 `Stopping` → 广播 → 插件逆序 `stop` → 排空任务 → dispose。广播晚于排空会让「优雅收尾」失去窗口；这是硬不变量，`cancelled_fires_before_task_drain` 守着它。
+- `Signal` 必须电平触发，且「置位 + 唤醒」与「复查 + 入列」在同一把锁下完成，否则会出现「先查后注册」的丢唤醒。
+- `StopHandle::request_stop()` 只置请求位并广播，**不得**改动生命周期状态或 `is_stopping`：请求与清理是两件事。
+- 任务取消分两个语义：`TaskHandle::abort()`（owner 意图）不得计入停止错误；只有排空预算耗尽才报 `TaskAborted`。两者必须写进同一个 `TaskOutcome`（`AbortedByOwner` / `AbortedByTimeout`），**不得**拆成「结局 + 旁边一个来源原子」——那会留下「结局已落定、来源标记还没写入」的窗口，把 owner 取消误报成超时。取消方必须补发完成信号——被 abort 的任务不会再执行收尾代码。
+- **完成信号的写者必须覆盖整个任务，而不只是任务体**：`emit_notify` 跑的是用户 handler，它 panic 时 wrapper 会在写结局之前展开。`FinishOnUnwind` 是那条兜底路径，不得删除；删掉它，一次 handler panic 就能让 `stop()` / `TaskHandle::wait` 永久挂起（`panicking_task_failed_handler_does_not_hang_stop` 守着）。
+- `Signal` 的注册项按 token（`NEXT_WAITER_TOKEN`）区分，**不得**按 waker 相等判重或摘除：同一任务里的两个 `cancelled()` 等待者共享同一个 waker，按 waker 去重会让其中一个的 `Drop` 摘掉另一个的唤醒源（`dropping_one_cancelled_waiter_keeps_the_other_registered` 守着）。
+- `start_failed_error` 不得假设「`Failed` 必有 `start_error`」：`from_bits` 的损坏兜底也会产出 `Failed`。
+- 任务排空发生在插件 stop 之后、dispose hooks 之前；`spawn` 在持有任务锁的临界区内检查停止态并填好 `AbortHandle`，杜绝 stop/spawn 竞态与「表里已有 cell 但 abort 句柄为空」。
+- 排空期间**不得持任务表锁**：`while let Some(t) = lock().pop()` 的临时值会活到循环体结束，必须写成 `loop { let Some(..) = ... else { break } }`。
+- `stop_with_timeout` 的预算为全部任务的总预算；超时任务 abort 后记 `TaskAborted`，不阻塞后续任务与 dispose。预算按每次调用重算，重入会拿到新预算。
 
 ---
 
@@ -96,8 +114,14 @@ src/
 ```bash
 cargo fmt --check
 cargo clippy --all-targets
+cargo clippy --no-default-features --all-targets
 cargo test --all-targets
+cargo test --no-default-features
 cargo test --doc
+
+# `cargo test --all-targets` 只**编译** examples，`main()` 不会运行，示例里的
+# assert 因此不参与判定。改动示例或文档引用的示例后必须真正跑一遍：
+for example in examples/*.rs; do cargo run --quiet --example "$(basename "$example" .rs)"; done
 ```
 
 必须维持的测试类别：
@@ -113,6 +137,16 @@ cargo test --doc
 - 插件依赖环检测
 - 事件串行/并行/冒泡/Bail/取消订阅
 - 结构化错误 kind/phase/plugin
+- 生命周期转换：`Failed` 重入返回 `StartFailed`、首错可经 `source` / `start_error()` 取回、部分启动的插件全部被回收
+- `Starting`（start future 被取消）重入 `StartFailed`，已进入的插件仍可被 `stop` 回收
+- `stop` 续跑：插件段 / 任务排空段 / dispose 段的 future 分别被丢弃后，重入仍完成清理且不谎报成功
+- 累积错误跨重入保留（`stop_errors`）
+- 取消信号：未停止时保持挂起、停止后立即就绪（电平触发）；广播**早于**任务排空
+- `StopHandle`：请求幂等、唤醒等待者，且不改变 `is_stopping`、不拒绝 `spawn`/`scope`
+- `TaskHandle`：`abort()` 后 `wait()` 返回 `Ok` 且排空不计入停止错误；`wait()` 对任务体错误与 panic 的返回；任务 id 与 `TaskFailed` 事件一致
+- panic 任务在排空时上报 `TaskFailed`
+- `id()` 与 `children()` 同源：Builder 阶段即可登记，build 后 `handle().id()` 不变
+- Drop 护栏：debug 构建下「曾进入启动流程却未 `stop`」即 drop 会 panic
 
 ---
 
@@ -122,6 +156,7 @@ cargo test --doc
   - `README.md`
   - `docs/architecture.md`
   - `docs/USAGE.md`
-- 新增对外行为特性需带可运行示例（或扩展示有示例）；`examples/` 被 `cargo test --all-targets` 编译验证，作为 USAGE.md 片段的编译基准，USAGE 对应小节需标注示例出处。
+- 新增对外行为特性需带可运行示例（或扩展示有示例）；`examples/` 被 `cargo test --all-targets` 编译验证，USAGE 对应小节需标注示例出处。
+- 注意 USAGE.md 里的代码片段**不参与编译**（本 crate 目前只有 1 个 doctest）。改动文档片段时必须自行核对，否则类型不匹配、闭包生命周期推断失败这类错误会静默留存。
 - 删除旧 API 前确认无内部引用，且示例与测试全部迁移。
 - 不导出 `Data` / `PluginRecord` / `ScopeLease` 等内部实现类型。

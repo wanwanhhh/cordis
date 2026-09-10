@@ -44,8 +44,11 @@ mod event;
 mod plugin;
 mod service;
 
+#[cfg(feature = "tokio")]
+pub use context::TaskHandle;
 pub use context::{
-    AsyncHook, Builder, Configurator, Context, LifecycleHook, Runtime, SyncHook, TaskFailed,
+    AsyncHook, Builder, Configurator, Context, LifecycleHook, Runtime, StopHandle, SyncHook,
+    TaskFailed,
 };
 pub use error::{Error, ErrorKind, Phase};
 pub use event::{
@@ -796,6 +799,328 @@ mod tests {
     }
 
     #[test]
+    fn partial_start_failure_reclaims_every_entered_plugin() {
+        let observed = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        struct OkPlugin(Arc<Mutex<Vec<&'static str>>>);
+        struct BadPlugin(Arc<Mutex<Vec<&'static str>>>);
+
+        #[async_trait]
+        impl Plugin for OkPlugin {
+            async fn start(&self, _ctx: &Context) -> Result<(), Error> {
+                self.0.lock().unwrap().push("ok_start");
+                Ok(())
+            }
+
+            async fn stop(&self, _ctx: &Context) -> Result<(), Error> {
+                self.0.lock().unwrap().push("ok_stop");
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl Plugin for BadPlugin {
+            async fn start(&self, _ctx: &Context) -> Result<(), Error> {
+                self.0.lock().unwrap().push("bad_start");
+                Err(Error::new(Phase::Start, ErrorKind::Other))
+            }
+
+            async fn stop(&self, _ctx: &Context) -> Result<(), Error> {
+                self.0.lock().unwrap().push("bad_stop");
+                Ok(())
+            }
+        }
+
+        let mut builder = Builder::new();
+        builder.plugin(OkPlugin(observed.clone())).unwrap();
+        builder.plugin(BadPlugin(observed.clone())).unwrap();
+
+        let mut rt = builder.build().unwrap();
+        assert!(block_on(rt.start_serial()).is_err());
+        block_on(rt.stop()).unwrap();
+
+        // 串行序为 [ok, bad]，失败插件也已被记入，故逆序回收两者。
+        assert_eq!(
+            &*observed.lock().unwrap(),
+            &["ok_start", "bad_start", "bad_stop", "ok_stop"]
+        );
+    }
+
+    #[test]
+    fn start_failure_blocks_reentry_and_preserves_first_error() {
+        let starts = Arc::new(AtomicUsize::new(0));
+
+        struct Failing(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl Plugin for Failing {
+            async fn start(&self, _ctx: &Context) -> Result<(), Error> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(Error::new(Phase::Start, ErrorKind::Other))
+            }
+        }
+
+        let mut builder = Builder::new();
+        builder.plugin(Failing(starts.clone())).unwrap();
+        let mut rt = builder.build().unwrap();
+
+        // 首次失败按原样返回聚合错误，调用方不必先扒 source 链。
+        let err = block_on(rt.start()).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::Multiple(_)));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        // start_error() 暴露同一份聚合错误。
+        let queried = rt.start_error().expect("失败后应可查询首错");
+        assert!(matches!(queried.kind, ErrorKind::Multiple(_)));
+
+        // 重入被明确拒绝，而不是伪装成成功；根因挂在 source 链上。
+        let reentry = block_on(rt.start()).unwrap_err();
+        assert!(matches!(reentry.kind, ErrorKind::StartFailed));
+        let aggregate = reentry
+            .source()
+            .and_then(|source| source.downcast_ref::<Error>())
+            .expect("重入错误应把首错挂在 source 链上");
+        assert!(matches!(aggregate.kind, ErrorKind::Multiple(_)));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        // 失败态仍可 stop 回收；进入终态后 start 回到 no-op。
+        block_on(rt.stop()).unwrap();
+        block_on(rt.start()).unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dropped_stop_future_resumes_instead_of_reporting_success() {
+        use std::future::Future;
+        use std::task::{Context as TaskContext, Poll};
+
+        let stops = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let entered = Arc::new(AtomicUsize::new(0));
+
+        struct SlowStop {
+            log: Arc<Mutex<Vec<&'static str>>>,
+            entered: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Plugin for SlowStop {
+            async fn stop(&self, _ctx: &Context) -> Result<(), Error> {
+                // 首次进入就挂起，模拟 stop future 在插件 await 中被丢弃。
+                if self.entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                    futures::future::pending::<()>().await;
+                }
+                self.log.lock().unwrap().push("stopped");
+                Ok(())
+            }
+        }
+
+        let mut builder = Builder::new();
+        builder
+            .plugin(SlowStop {
+                log: stops.clone(),
+                entered: entered.clone(),
+            })
+            .unwrap();
+        let mut rt = builder.build().unwrap();
+        block_on(rt.start()).unwrap();
+
+        // 手动 poll 一次 stop，让它停在插件的 await 上，然后整体丢弃。
+        let waker = futures::task::noop_waker();
+        let mut task_cx = TaskContext::from_waker(&waker);
+        {
+            let mut fut = Box::pin(rt.stop());
+            assert!(matches!(fut.as_mut().poll(&mut task_cx), Poll::Pending));
+        }
+
+        // 状态停在 Stopping，插件 stop 尚未完成。
+        assert!(rt.handle().is_stopping());
+        assert!(stops.lock().unwrap().is_empty());
+
+        // 重入续跑：游标未推进，该项被重试并完成，而不是被当作已停止。
+        block_on(rt.stop()).unwrap();
+        assert_eq!(&*stops.lock().unwrap(), &["stopped"]);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn dropped_stop_future_keeps_inflight_task_tracked() {
+        use futures::FutureExt;
+
+        struct Dummy;
+
+        #[async_trait]
+        impl Plugin for Dummy {}
+
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        tokio_rt.block_on(async {
+            let mut builder = Builder::new();
+            builder.plugin(Dummy).unwrap();
+            let mut rt = builder.build().unwrap();
+            rt.start().await.unwrap();
+
+            let ctx = rt.handle();
+            ctx.spawn(async {
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+            .unwrap();
+
+            // 首次 stop 停在任务排空的 await 上，然后被整体丢弃。
+            assert!(rt.stop().now_or_never().is_none());
+            assert!(ctx.is_stopping());
+
+            // 重入时那个在飞任务必须仍被跟踪：给一个短预算，它应被 abort 并计入
+            // 聚合错误，而不是因为句柄已随上一次 future detach 而被当作「已排空」。
+            let err = rt
+                .stop_with_timeout(std::time::Duration::from_millis(10))
+                .await
+                .unwrap_err();
+            let ErrorKind::Multiple(errors) = &err.kind else {
+                panic!("expected aggregated error, got {:?}", err.kind);
+            };
+            assert_eq!(errors.len(), 1);
+            assert!(matches!(
+                errors[0].kind,
+                ErrorKind::TaskAborted { task_id: 0 }
+            ));
+        });
+    }
+
+    #[test]
+    fn dropped_start_future_blocks_reentry_and_stays_reclaimable() {
+        use std::future::Future;
+        use std::task::{Context as TaskContext, Poll};
+
+        let entered = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        struct SlowStart {
+            entered: Arc<AtomicUsize>,
+            stops: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl Plugin for SlowStart {
+            async fn start(&self, _ctx: &Context) -> Result<(), Error> {
+                // 首次进入就挂起，模拟 start future 被丢弃。
+                if self.entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                    futures::future::pending::<()>().await;
+                }
+                Ok(())
+            }
+
+            async fn stop(&self, _ctx: &Context) -> Result<(), Error> {
+                self.stops.lock().unwrap().push("stopped");
+                Ok(())
+            }
+        }
+
+        let mut builder = Builder::new();
+        builder
+            .plugin(SlowStart {
+                entered: entered.clone(),
+                stops: stops.clone(),
+            })
+            .unwrap();
+        let mut rt = builder.build().unwrap();
+
+        // 手动 poll 一次 start，让它停在插件的 await 上，然后整体丢弃。
+        let waker = futures::task::noop_waker();
+        let mut task_cx = TaskContext::from_waker(&waker);
+        {
+            let mut fut = Box::pin(rt.start());
+            assert!(matches!(fut.as_mut().poll(&mut task_cx), Poll::Pending));
+        }
+
+        // 被中断的启动不得谎报成功：重入返回 StartFailed，且因没有记录到失败而不带 source。
+        let err = block_on(rt.start()).unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::StartFailed));
+        assert!(err.source().is_none());
+        assert!(rt.start_error().is_none());
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+
+        // 已进入启动流程的插件仍可被 stop 回收。
+        block_on(rt.stop()).unwrap();
+        assert_eq!(&*stops.lock().unwrap(), &["stopped"]);
+    }
+
+    #[test]
+    fn dropped_stop_future_resumes_dispose_and_keeps_earlier_errors() {
+        use std::future::Future;
+        use std::task::{Context as TaskContext, Poll};
+
+        let dispose_runs = Arc::new(AtomicUsize::new(0));
+
+        struct BadStop;
+
+        #[async_trait]
+        impl Plugin for BadStop {
+            async fn stop(&self, _ctx: &Context) -> Result<(), Error> {
+                Err(Error::new(Phase::Stop, ErrorKind::Other))
+            }
+        }
+
+        let mut builder = Builder::new();
+        builder.plugin(BadStop).unwrap();
+
+        // dispose 首次调用挂起，好让 stop 停在 dispose 段的中途。
+        let counter = dispose_runs.clone();
+        builder
+            .on_dispose(AsyncHook(move |_ctx: Context| {
+                let counter = counter.clone();
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        futures::future::pending::<()>().await;
+                    }
+                    Ok(())
+                }
+            }))
+            .unwrap();
+
+        let mut rt = builder.build().unwrap();
+        block_on(rt.start()).unwrap();
+
+        // 首次 stop：插件 stop 已经报错（记入累积错误），随后停在 dispose 的 await 上。
+        let waker = futures::task::noop_waker();
+        let mut task_cx = TaskContext::from_waker(&waker);
+        {
+            let mut fut = Box::pin(rt.stop());
+            assert!(matches!(fut.as_mut().poll(&mut task_cx), Poll::Pending));
+        }
+
+        // 重入：dispose 被重试并完成，而上一轮记录的插件错误必须仍在——不能被吞掉
+        // （若累积错误退回局部 Vec，这里会得到 Ok）。
+        let err = block_on(rt.stop()).unwrap_err();
+        let ErrorKind::Multiple(errors) = &err.kind else {
+            panic!("expected aggregated error, got {:?}", err.kind);
+        };
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0].phase, Phase::Stop));
+        assert!(matches!(errors[0].kind, ErrorKind::Other));
+        assert_eq!(dispose_runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "dropped without stop")]
+    fn dropping_running_runtime_without_stop_is_caught() {
+        struct Dummy;
+
+        #[async_trait]
+        impl Plugin for Dummy {}
+
+        let mut builder = Builder::new();
+        builder.plugin(Dummy).unwrap();
+        let mut rt = builder.build().unwrap();
+        block_on(rt.start()).unwrap();
+        // 故意不 stop：Drop 护栏应在 debug 构建下硬失败。
+    }
+
+    #[test]
     fn ready_hook_failure_is_fail_fast() {
         let run_count = Arc::new(AtomicUsize::new(0));
 
@@ -831,6 +1156,9 @@ mod tests {
         let mut rt = builder.build().unwrap();
         assert!(block_on(rt.start()).is_err());
         assert_eq!(run_count.load(Ordering::SeqCst), 2);
+        // 启动失败后仍处于待清理状态，必须显式 stop 回收；
+        // 否则 Drop 护栏会（正确地）报出生命周期未归还。
+        block_on(rt.stop()).unwrap();
     }
 
     #[test]
@@ -872,45 +1200,6 @@ mod tests {
     }
 
     #[test]
-    fn scope_on_ready_dispose_run_once() {
-        let ready_count = Arc::new(AtomicUsize::new(0));
-        let dispose_count = Arc::new(AtomicUsize::new(0));
-
-        struct Dummy;
-
-        #[async_trait]
-        impl Plugin for Dummy {}
-
-        let mut builder = Builder::new();
-        let ready_counter = ready_count.clone();
-        builder
-            .on_ready(SyncHook(move |_: &Context| {
-                ready_counter.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }))
-            .unwrap();
-
-        let dispose_counter = dispose_count.clone();
-        builder
-            .on_dispose(SyncHook(move |_: &Context| {
-                dispose_counter.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }))
-            .unwrap();
-
-        builder.plugin(Dummy).unwrap();
-
-        let mut rt = builder.build().unwrap();
-        block_on(rt.start()).unwrap();
-        block_on(rt.start()).unwrap();
-        block_on(rt.stop()).unwrap();
-        block_on(rt.stop()).unwrap();
-
-        assert_eq!(ready_count.load(Ordering::SeqCst), 1);
-        assert_eq!(dispose_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
     fn context_clone_does_not_block_stop() {
         let builder = Builder::new();
         let mut rt = builder.build().unwrap();
@@ -921,16 +1210,23 @@ mod tests {
 
     #[test]
     fn async_hook_registration_works() {
+        let runs = Arc::new(AtomicUsize::new(0));
+
         struct Dummy;
 
         #[async_trait]
         impl Plugin for Dummy {}
 
         let mut builder = Builder::new();
+        let counter = runs.clone();
         builder
-            .on_ready(AsyncHook(|ctx: Context| async move {
-                let _ = ctx;
-                Ok(())
+            .on_ready(AsyncHook(move |ctx: Context| {
+                let counter = counter.clone();
+                async move {
+                    let _ = ctx;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
             }))
             .unwrap();
 
@@ -939,6 +1235,9 @@ mod tests {
         let mut rt = builder.build().unwrap();
         block_on(rt.start()).unwrap();
         block_on(rt.stop()).unwrap();
+
+        // AsyncHook 必须真的被执行，而不是只注册成功。
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1121,21 +1420,7 @@ mod tests {
     fn event_off_unsubscribes() {
         struct Ping;
 
-        let mut builder = Builder::new();
-        let observed = Arc::new(Mutex::new(Vec::new()));
-
-        let handler = observed.clone();
-        let _subscription = builder
-            .on::<Ping, _>(FnEventHandler(move |_: &Ping, _: &Context| {
-                handler.lock().unwrap().push("called");
-                Ok(EventControl::Continue)
-            }))
-            .unwrap();
-
-        let rt = builder.build().unwrap();
-        let ctx = rt.handle();
-        block_on(ctx.emit(Ping)).unwrap();
-        // off 只能在 Builder 阶段使用；这里再建一个 Builder 验证取消机制。
+        // off 只能在 Builder 阶段使用。
         let mut builder = Builder::new();
         let observed = Arc::new(Mutex::new(Vec::new()));
         let handler = observed.clone();
@@ -1713,12 +1998,18 @@ mod tests {
 
         let mut builder = Builder::new();
         builder.plugin(NeedsMissing).unwrap();
-        let (builder, err) = match builder.try_build() {
+        let (mut builder, err) = match builder.try_build() {
             Ok(_) => panic!("try_build should fail"),
             Err(pair) => pair,
         };
         assert!(matches!(err.kind, ErrorKind::ServiceNotFound(_)));
-        assert!(!builder.verify().is_ok());
+        builder.verify().unwrap_err();
+
+        // try_build 的契约：校验失败把 Builder 完整带回；补齐依赖后应能照常构建运行。
+        builder.provide(Missing).unwrap();
+        let mut rt = builder.build().unwrap();
+        block_on(rt.start()).unwrap();
+        block_on(rt.stop()).unwrap();
     }
 
     #[test]
@@ -2120,27 +2411,70 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[test]
     fn stop_waits_for_spawned_tasks() {
-        let done = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = futures::channel::oneshot::channel::<()>();
-        let task_done = done.clone();
-        tokio_block_on(async move {
+        tokio_block_on(async {
             let mut rt = Builder::new().build().unwrap();
             rt.start().await.unwrap();
             let ctx = rt.handle();
+
+            let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
             ctx.spawn(async move {
-                let _ = rx.await;
-                task_done.fetch_add(1, Ordering::SeqCst);
+                let _ = release_rx.await;
                 Ok::<(), Error>(())
             })
             .unwrap();
             assert_eq!(ctx.task_count(), 1);
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(30));
-                let _ = tx.send(());
-            });
-            rt.stop().await.unwrap();
+
+            // 关键断言：手动 poll 一次 `stop()` 必须停在「等在飞任务」的 await 上。
+            // 若排空不等待（取出即返回），这里已经 Ready，本测试变红——靠
+            // `join!` + 时间差做不到这一点，那只能证明「注册表不再报告它」。
+            let mut stopper = std::pin::pin!(rt.stop());
+            assert!(futures::poll!(stopper.as_mut()).is_pending());
+            assert_eq!(ctx.task_count(), 1);
+
+            let _ = release_tx.send(());
+            stopper.await.unwrap();
+            assert_eq!(ctx.task_count(), 0);
         });
-        assert_eq!(done.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn panicking_task_failed_handler_does_not_hang_stop() {
+        // 上报路径（emit_notify → 用户 handler）在任务体之外、仍在这个任务里。它
+        // panic 时 wrapper 会在写结局之前展开——若没有兜底，完成信号永不触发，
+        // `wait()` 与 `stop()` 会一起挂死，超时排空还会把它误报成 TaskAborted。
+        let mut builder = Builder::new();
+        builder
+            .on::<TaskFailed, _>(FnEventHandler(|_: &TaskFailed, _: &Context| {
+                panic!("TaskFailed handler boom")
+            }))
+            .unwrap();
+        tokio_block_on(async move {
+            let mut rt = builder.build().unwrap();
+            rt.start().await.unwrap();
+            let task = rt
+                .handle()
+                .spawn(async { Err::<(), Error>(Error::new(Phase::Start, ErrorKind::Other)) })
+                .unwrap();
+
+            let waited = tokio::time::timeout(std::time::Duration::from_secs(5), task.wait())
+                .await
+                .expect("完成信号丢失：上报路径 panic 未被兜住");
+            assert!(waited.is_err(), "结局应被记为 panic");
+            assert!(task.is_finished());
+
+            let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), rt.stop())
+                .await
+                .expect("stop 挂起：完成信号丢失")
+                .unwrap_err();
+            let ErrorKind::Multiple(errors) = stopped.kind else {
+                panic!("expected aggregated error, got {:?}", stopped.kind);
+            };
+            assert!(matches!(
+                errors[0].kind,
+                ErrorKind::TaskFailed { task_id: 0 }
+            ));
+        });
     }
 
     #[cfg(feature = "tokio")]
@@ -2159,6 +2493,15 @@ mod tests {
                 Ok::<(), Error>(())
             })
             .unwrap();
+            // 先确认任务真的被调度过，否则慢机器上 50ms 预算可能先到、任务还没开始，
+            // `started == 1` 会假红。这里等待的是「已开始」，不是「已完成」。
+            for _ in 0..1000 {
+                if started.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(started.load(Ordering::SeqCst), 1, "任务必须先真正开始");
             std::mem::forget(tx);
             let err = rt
                 .stop_with_timeout(std::time::Duration::from_millis(50))
@@ -2175,7 +2518,92 @@ mod tests {
                 other => panic!("unexpected error kind: {other:?}"),
             }
         });
-        assert_eq!(started.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn dropping_task_handle_wait_future_unregisters_waiter() {
+        // `TaskHandle::wait()` 会被反复丢弃（`select!` 里另一个分支先就绪、被
+        // `timeout` 包裹等）。每次丢弃都必须摘掉自己的注册项，否则该 cell 的等待者
+        // 列表会随这类尝试单调增长。
+        tokio_block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+            let task = ctx
+                .spawn(async {
+                    futures::future::pending::<()>().await;
+                    Ok::<(), Error>(())
+                })
+                .unwrap();
+
+            for _ in 0..3 {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(1), task.wait()).await;
+            }
+            assert!(
+                ctx.pending_task_waiters() <= 1,
+                "被丢弃的 wait future 残留了注册项: {}",
+                ctx.pending_task_waiters()
+            );
+
+            task.abort();
+            assert!(task.wait().await.is_ok());
+            rt.stop().await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn stop_with_timeout_accepts_absurd_budget() {
+        // `Instant::now() + Duration::MAX` 会溢出 panic；实现用 `checked_add` 把它
+        // 降级为「不设超时」。这个用例钉住那条降级路径不被改回裸加法。
+        tokio_block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            rt.handle().spawn(async { Ok::<(), Error>(()) }).unwrap();
+            rt.stop_with_timeout(std::time::Duration::MAX)
+                .await
+                .unwrap();
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn host_runtime_shutdown_does_not_fabricate_task_failure() {
+        // 宿主 runtime 关闭会把在飞任务的 future 直接丢掉（非展开）。这不等于 panic：
+        // 兜底守卫若一律记 `Panicked`，`stop()` 就会凭空多出一条 `TaskFailed`。
+        let host = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let (mut rt, ctx) = host.block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+            ctx.spawn(async {
+                futures::future::pending::<()>().await;
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+            // 先让它真的被 poll 一次并 park（兜底守卫只在任务体开始执行后才存在）。
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            assert_eq!(ctx.task_count(), 1);
+            (rt, ctx)
+        });
+        drop(host);
+
+        tokio_block_on(async move {
+            let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), rt.stop())
+                .await
+                .expect("完成信号丢失：非展开丢弃未被兜住");
+            assert!(
+                stopped.is_ok(),
+                "宿主 runtime 关闭被误报成任务失败: {stopped:?}"
+            );
+            assert_eq!(ctx.task_count(), 0);
+        });
     }
 
     #[cfg(feature = "tokio")]
@@ -2215,7 +2643,83 @@ mod tests {
                 }
                 tokio::task::yield_now().await;
             }
-            assert_eq!(ctx.task_count(), 0);
+            // `task_count` 会过滤已结束的，所以它证明不了「剪除」这件事——必须看
+            // 注册表原长：此刻两个已结束的 cell 都还在表里。
+            assert_eq!(ctx.registered_task_count(), 2);
+            // 再 spawn 一次才触发剪除，表里只剩这个新任务。
+            ctx.spawn(async { Ok::<(), Error>(()) }).unwrap();
+            assert_eq!(ctx.registered_task_count(), 1);
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn pruning_keeps_unreported_panic_outcome() {
+        tokio_block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+
+            let panicked = ctx.spawn(async { panic!("boom") }).unwrap();
+            // 等 panic 结局落定：它只等排空上报，没有事件出口。
+            assert!(panicked.wait().await.is_err());
+
+            // 之后再 spawn 会触发剪除。未上报的 panic 结局必须被保住，否则 `stop`
+            // 会因为它之后又有人 spawn 过而静默报成功。
+            ctx.spawn(async { Ok::<(), Error>(()) }).unwrap();
+
+            let err = rt.stop().await.unwrap_err();
+            let ErrorKind::Multiple(errors) = err.kind else {
+                panic!("expected aggregated error, got {:?}", err.kind);
+            };
+            assert_eq!(errors.len(), 1);
+            assert!(matches!(
+                errors[0].kind,
+                ErrorKind::TaskFailed { task_id: 0 }
+            ));
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn task_handle_wait_returns_ok_on_success() {
+        tokio_block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let task = rt.handle().spawn(async { Ok::<(), Error>(()) }).unwrap();
+            assert!(task.wait().await.is_ok());
+            assert!(task.is_finished());
+            rt.stop().await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn task_ids_match_failed_event() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let handler_observed = observed.clone();
+        tokio_block_on(async move {
+            let mut builder = Builder::new();
+            builder
+                .on::<TaskFailed, _>(FnEventHandler(move |event: &TaskFailed, _: &Context| {
+                    handler_observed.lock().unwrap().push(event.task_id);
+                    Ok(EventControl::Continue)
+                }))
+                .unwrap();
+            let mut rt = builder.build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+
+            let ok = ctx.spawn(async { Ok::<(), Error>(()) }).unwrap();
+            let failing = ctx
+                .spawn(async { Err::<(), Error>(Error::new(Phase::Start, ErrorKind::Other)) })
+                .unwrap();
+            // id 在同一作用域内从 0 单调递增，不是恒为 0 的默认值。
+            assert_eq!((ok.id(), failing.id()), (0, 1));
+
+            let _ = failing.wait().await.unwrap_err();
+            assert_eq!(*observed.lock().unwrap(), vec![failing.id()]);
+            rt.stop().await.unwrap();
         });
     }
 
@@ -2252,6 +2756,402 @@ mod tests {
             assert_eq!(*observed.lock().unwrap(), vec![(0, true)]);
             scope_rt.stop().await.unwrap();
             drop(scope_rt);
+            rt.stop().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn cancelled_is_level_triggered() {
+        use futures::FutureExt;
+
+        block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            let ctx = rt.handle();
+            // 未停止：等待点保持挂起（不能立即就绪，否则等待形同虚设）。
+            assert!(ctx.cancelled().now_or_never().is_none());
+            rt.stop().await.unwrap();
+            // 已停止：立即就绪。晚到的等待者不会永远挂起。
+            assert!(ctx.cancelled().now_or_never().is_some());
+            // 「请求」与「停止」是两件事，没人请求时请求标记保持 false。
+            assert!(!rt.stop_handle().is_stop_requested());
+        });
+    }
+
+    /// 手工 waker 探针：只关心「有没有被唤醒」与「唤醒时刻请求位是否已可见」，
+    /// 因此不需要 tokio，也不受 `--no-default-features` 影响——这样 `StopHandle`
+    /// 的契约在无 tokio 配置下也有真实覆盖。
+    #[test]
+    fn stop_handle_request_wakes_registered_waiter_and_keeps_scope_usable() {
+        use futures::task::ArcWake;
+        use std::task::Context as TaskContext;
+
+        struct FlagWaker {
+            woken: Arc<std::sync::atomic::AtomicBool>,
+            /// 唤醒时刻读到的请求位。`request_stop` 必须先写请求位再广播，否则被
+            /// 唤醒的等待者会看到「已取消但还没请求」的矛盾状态。
+            request_visible: Arc<std::sync::atomic::AtomicBool>,
+            handle: StopHandle,
+        }
+
+        impl ArcWake for FlagWaker {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.woken.store(true, Ordering::SeqCst);
+                arc_self
+                    .request_visible
+                    .store(arc_self.handle.is_stop_requested(), Ordering::SeqCst);
+            }
+        }
+
+        block_on(async {
+            let rt = Builder::new().build().unwrap();
+            let ctx = rt.handle();
+            let handle = rt.stop_handle();
+
+            let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let request_visible = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let waker = futures::task::waker(Arc::new(FlagWaker {
+                woken: woken.clone(),
+                request_visible: request_visible.clone(),
+                handle: handle.clone(),
+            }));
+            let mut cx = TaskContext::from_waker(&waker);
+
+            let mut waiting = Box::pin(handle.cancelled());
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            assert!(!woken.load(Ordering::SeqCst));
+            assert_eq!(ctx.cancellation_waiters(), 1);
+
+            handle.clone().request_stop();
+            handle.request_stop(); // 幂等
+            assert!(handle.is_stop_requested());
+            assert!(woken.load(Ordering::SeqCst), "请求必须唤醒已注册的等待者");
+            assert!(
+                request_visible.load(Ordering::SeqCst),
+                "请求位必须在广播之前写入"
+            );
+            assert!(waiting.as_mut().poll(&mut cx).is_ready());
+            assert_eq!(ctx.cancellation_waiters(), 0);
+
+            // 请求不等于进入清理：`is_stopping` 仍为 false，`scope` 也不被拒绝。
+            assert!(!ctx.is_stopping());
+            drop(ctx.scope().unwrap());
+            drop(waiting);
+
+            // 未 start，Drop 护栏不会触发。
+            drop(rt);
+        });
+    }
+
+    #[test]
+    fn cancelled_future_drop_unregisters_waiter() {
+        block_on(async {
+            let rt = Builder::new().build().unwrap();
+            let ctx = rt.handle();
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+
+            let mut waiting = Box::pin(ctx.cancelled());
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(ctx.cancellation_waiters(), 1);
+
+            // 等待者主动放弃（典型：`select!` 里先等到别的事件）必须摘掉自己的
+            // waker，否则长生命周期作用域的等待者列表会随这类任务单调增长。
+            drop(waiting);
+            assert_eq!(ctx.cancellation_waiters(), 0);
+            drop(rt);
+        });
+    }
+
+    #[test]
+    fn dropping_one_cancelled_waiter_keeps_the_other_registered() {
+        block_on(async {
+            let rt = Builder::new().build().unwrap();
+            let ctx = rt.handle();
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+
+            // 同一任务/同一 waker 下的两个等待者。按 waker 相等去重会让他们共享一条
+            // 注册项，drop 其中一个就把另一个的唤醒源一起摘掉——摘除必须按注册身份
+            // （token）进行，谁注册谁负责摘自己。
+            let mut first = Box::pin(ctx.cancelled());
+            let mut second = Box::pin(ctx.cancelled());
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+            assert!(second.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(ctx.cancellation_waiters(), 2);
+
+            drop(second);
+            assert_eq!(ctx.cancellation_waiters(), 1, "只应摘掉被丢弃的那一个");
+
+            rt.stop_handle().request_stop();
+            assert!(
+                first.as_mut().poll(&mut cx).is_ready(),
+                "存活等待者的唤醒源被误摘了"
+            );
+            drop(first);
+            drop(rt);
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn cancelled_wakes_waiter_across_worker_threads() {
+        let observed = Arc::new(AtomicUsize::new(0));
+        let task_observed = observed.clone();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            let mut cordis_rt = Builder::new().build().unwrap();
+            cordis_rt.start().await.unwrap();
+            let ctx = cordis_rt.handle();
+
+            let wait_ctx = ctx.clone();
+            ctx.spawn(async move {
+                wait_ctx.cancelled().await;
+                task_observed.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+
+            // 注册 waker 与触发停止可能落在不同 worker 线程上——`Signal` 的
+            // 「同锁置位/复查」正是为这种交错准备的。
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            cordis_rt.stop().await.unwrap();
+        });
+
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn cancelled_fires_before_task_drain() {
+        let observed = Arc::new(AtomicUsize::new(0));
+        let task_observed = observed.clone();
+        tokio_block_on(async move {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+
+            // 该任务只在收到取消信号后才结束。
+            let wait_ctx = ctx.clone();
+            ctx.spawn(async move {
+                wait_ctx.cancelled().await;
+                task_observed.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+
+            // 关键：必须等任务真的把 waker 注册进 `Signal` 再 stop。否则它会在 stop
+            // 之后才被首次 poll，走 `poll_cancelled` 的状态快路径直接 Ready——那样
+            // 这个测试就测不到「广播是否真的发出、是否早于排空」（把广播移到排空
+            // 之后、或删掉唤醒循环，都仍然会绿）。
+            for _ in 0..1000 {
+                if ctx.cancellation_waiters() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(ctx.cancellation_waiters(), 1, "任务未注册取消等待者");
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), rt.stop())
+                .await
+                .expect("stop 未在 5s 内完成：广播晚于排空，或唤醒丢失")
+                .unwrap();
+        });
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn stop_handle_request_wakes_waiters_without_starting_cleanup() {
+        let observed = Arc::new(AtomicUsize::new(0));
+        let task_observed = observed.clone();
+        tokio_block_on(async move {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+            let handle = rt.stop_handle();
+            assert!(!handle.is_stop_requested());
+
+            let wait_ctx = ctx.clone();
+            ctx.spawn(async move {
+                wait_ctx.cancelled().await;
+                task_observed.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+
+            let cloned = handle.clone();
+            cloned.request_stop();
+            handle.request_stop(); // 幂等
+            assert!(handle.is_stop_requested());
+
+            // 请求不等于进入清理：拒绝新工作仍要等真正 `stop`。
+            assert!(!ctx.is_stopping());
+            assert!(ctx.spawn(async { Ok::<(), Error>(()) }).is_ok());
+
+            for _ in 0..1000 {
+                if observed.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(observed.load(Ordering::SeqCst), 1);
+
+            rt.stop().await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn owner_aborted_task_is_not_a_stop_error() {
+        tokio_block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+
+            let task = ctx
+                .spawn(async {
+                    futures::future::pending::<()>().await;
+                    Ok::<(), Error>(())
+                })
+                .unwrap();
+            assert_eq!(task.id(), 0);
+            assert!(!task.is_finished());
+
+            task.abort();
+            // 取消是请求，不是失败。
+            assert!(task.wait().await.is_ok());
+            assert!(task.is_finished());
+
+            // 排空看到的是「owner 主动取消」，不得计入停止错误。
+            rt.stop().await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn task_handle_wait_returns_body_error() {
+        tokio_block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+
+            let task = ctx
+                .spawn(async { Err::<(), Error>(Error::new(Phase::Start, ErrorKind::Other)) })
+                .unwrap();
+            let err = task.wait().await.unwrap_err();
+            assert!(matches!(err.kind, ErrorKind::Other));
+
+            rt.stop().await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn panicking_task_is_reported_at_drain() {
+        tokio_block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            rt.handle().spawn(async { panic!("boom") }).unwrap();
+
+            let err = rt.stop().await.unwrap_err();
+            let ErrorKind::Multiple(errors) = err.kind else {
+                panic!("expected aggregated error, got {:?}", err.kind);
+            };
+            assert_eq!(errors.len(), 1);
+            assert!(matches!(
+                errors[0].kind,
+                ErrorKind::TaskFailed { task_id: 0 }
+            ));
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn abort_after_completion_does_not_mask_panic_outcome() {
+        tokio_block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+
+            let task = ctx.spawn(async { panic!("boom") }).unwrap();
+            // 等它真的结束：panic 的结局对 wait() 是 TaskFailed。
+            assert!(matches!(
+                task.wait().await.unwrap_err().kind,
+                ErrorKind::TaskFailed { task_id: 0 }
+            ));
+
+            // 迟到的 abort 不得把结局改写成「被取消」而让 panic 在排空时消失。
+            task.abort();
+
+            let err = rt.stop().await.unwrap_err();
+            let ErrorKind::Multiple(errors) = err.kind else {
+                panic!("expected aggregated error, got {:?}", err.kind);
+            };
+            assert_eq!(errors.len(), 1);
+            assert!(matches!(
+                errors[0].kind,
+                ErrorKind::TaskFailed { task_id: 0 }
+            ));
+        });
+    }
+
+    #[test]
+    fn cancelled_is_per_layer_and_not_fired_by_rejected_stop() {
+        use futures::FutureExt;
+
+        block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+
+            let scope = ctx.scope().unwrap();
+            let mut child_rt = scope.build().unwrap();
+            child_rt.start().await.unwrap();
+            let child_ctx = child_rt.handle();
+
+            // 被活跃子租约拒绝的 stop 不算「进入关闭流程」：两层的信号都不该触发。
+            rt.stop().await.unwrap_err();
+            assert!(ctx.cancelled().now_or_never().is_none());
+            assert!(child_ctx.cancelled().now_or_never().is_none());
+
+            // 子层自己的 stop 只触发子层信号，父层不代子层广播。
+            child_rt.stop().await.unwrap();
+            assert!(child_ctx.cancelled().now_or_never().is_some());
+            assert!(ctx.cancelled().now_or_never().is_none());
+
+            drop(child_rt);
+            rt.stop().await.unwrap();
+            assert!(ctx.cancelled().now_or_never().is_some());
+        });
+    }
+
+    #[test]
+    fn context_id_matches_parent_children_list() {
+        block_on(async {
+            let mut rt = Builder::new().build().unwrap();
+            rt.start().await.unwrap();
+            let ctx = rt.handle();
+            let root_id = ctx.id();
+            assert!(ctx.children().is_empty());
+
+            let scope = ctx.scope().unwrap();
+            let child_id = scope.id();
+            assert_ne!(child_id, root_id);
+            assert_eq!(ctx.children(), vec![child_id]);
+
+            let child_rt = scope.build().unwrap();
+            assert_eq!(child_rt.handle().id(), child_id);
+            assert_eq!(child_rt.handle().parent().unwrap().id(), root_id);
+
+            // 未启动的子 Runtime 可以只 drop；租约随最后一个字段归还。
+            drop(child_rt);
+            assert!(ctx.children().is_empty());
+
             rt.stop().await.unwrap();
         });
     }

@@ -77,24 +77,18 @@ impl Hasher for TypeIdHasher {
 /// `TypeId` 键哈希表专用构建器。
 pub(crate) type TypeMap<V> = HashMap<TypeId, V, BuildHasherDefault<TypeIdHasher>>;
 
-/// 存储的服务实例。
-struct StoredService {
-    type_name: &'static str,
-    value: Box<dyn Any + Send + Sync>,
-}
-
-/// 存储的集合服务元素。
-struct StoredCollection {
-    type_name: &'static str,
-    value: Box<dyn Any + Send + Sync>,
-}
+/// 存储的服务实例 / 集合元素：类型擦除后的值。
+///
+/// `services` / `collections` 只由泛型 `provide*` 路径写入，键恒为
+/// `TypeId::of::<T>()`、值恒为同一个 `T` 装箱而来，所以取出时的 `downcast` 不可能
+/// 失败；`factories` 同理（键 `TypeId::of::<T>()`、值 `TypedFactory<T>`）。类型不
+/// 匹配是类型层面的不可能事件，不构成运行的错误分支。
+type StoredValue = Box<dyn Any + Send + Sync>;
 
 /// 类型擦除的服务工厂。
 trait ErasedFactory: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
-    /// 工厂产出值的真实类型名，用于类型不匹配诊断。
-    fn type_name(&self) -> &'static str;
 }
 
 /// 具体类型服务工厂。
@@ -122,20 +116,20 @@ impl<T: Send + Sync + 'static> TypedFactory<T> {
 
         let value = (self.factory)()?;
         let _ = self.value.set(value);
-        // `set` 在 `init_lock` 下执行，紧接的 `get` 必有值；此处不 panic，走错误通道。
-        self.value
-            .get()
-            .ok_or_else(|| Error::new(Phase::Build, ErrorKind::Other))
+        // `set` 在 `init_lock` 下执行，紧接的 `get` 必有值。不变式被破坏说明本类型
+        // 自身有 bug，不该伪装成可恢复的业务错误。
+        Ok(self.value.get().expect("factory value set under init_lock"))
     }
 
     fn get_mut(&mut self) -> Result<&mut T, Error> {
         if self.value.get().is_none() {
             self.get()?;
         }
-        // `get()` 成功后 OnceLock 必已置位；此处不 panic，走错误通道。
-        self.value
+        // `get()` 成功后 OnceLock 必已置位。
+        Ok(self
+            .value
             .get_mut()
-            .ok_or_else(|| Error::new(Phase::Build, ErrorKind::Other))
+            .expect("factory value set under init_lock"))
     }
 }
 
@@ -146,10 +140,6 @@ impl<T: Send + Sync + 'static> ErasedFactory for TypedFactory<T> {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
-    }
-
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<T>()
     }
 }
 
@@ -214,8 +204,8 @@ impl<T> DynamicValue<T> {
 /// 服务注册表。
 #[derive(Default)]
 pub struct ServiceRegistry {
-    services: TypeMap<StoredService>,
-    collections: TypeMap<Vec<StoredCollection>>,
+    services: TypeMap<StoredValue>,
+    collections: TypeMap<Vec<StoredValue>>,
     factories: TypeMap<Box<dyn ErasedFactory>>,
 }
 
@@ -234,13 +224,7 @@ impl ServiceRegistry {
                 ErrorKind::ServiceAlreadyRegistered(std::any::type_name::<T>().to_string()),
             ));
         }
-        self.services.insert(
-            key,
-            StoredService {
-                type_name: std::any::type_name::<T>(),
-                value: Box::new(value),
-            },
-        );
+        self.services.insert(key, Box::new(value));
         Ok(())
     }
 
@@ -272,15 +256,12 @@ impl ServiceRegistry {
         self.collections
             .entry(TypeId::of::<T>())
             .or_default()
-            .push(StoredCollection {
-                type_name: std::any::type_name::<T>(),
-                value: Box::new(value),
-            });
+            .push(Box::new(value));
         Ok(())
     }
 
     /// 类型查找的内部通道：`Ok(Some)` 命中，`Ok(None)` 本层未注册该类型槽位，
-    /// `Err` 为类型不匹配或工厂初始化失败。
+    /// `Err` 为工厂初始化失败。
     ///
     /// miss 路径不分配任何内存，供父链循环使用；工厂初始化失败一律以错误
     /// 传播，不会被降级为“不存在”。
@@ -288,34 +269,18 @@ impl ServiceRegistry {
         let key = TypeId::of::<T>();
 
         if let Some(service) = self.services.get(&key) {
-            return service
-                .value
-                .downcast_ref::<T>()
-                .map(Some)
-                .ok_or_else(|| {
-                    Error::new(
-                        Phase::Build,
-                        ErrorKind::ServiceTypeMismatch {
-                            expected: std::any::type_name::<T>(),
-                            found: service.type_name,
-                        },
-                    )
-                });
+            return Ok(Some(
+                service
+                    .downcast_ref::<T>()
+                    .expect("service key type matches stored value type"),
+            ));
         }
 
         if let Some(factory) = self.factories.get(&key) {
             return factory
                 .as_any()
                 .downcast_ref::<TypedFactory<T>>()
-                .ok_or_else(|| {
-                    Error::new(
-                        Phase::Build,
-                        ErrorKind::ServiceTypeMismatch {
-                            expected: std::any::type_name::<T>(),
-                            found: factory.type_name(),
-                        },
-                    )
-                })?
+                .expect("factory key type matches stored factory type")
                 .get()
                 .map(Some);
         }
@@ -345,16 +310,11 @@ impl ServiceRegistry {
         let mut result = Vec::new();
         if let Some(values) = self.collections.get(&TypeId::of::<T>()) {
             for stored in values {
-                let value = stored.value.downcast_ref::<T>().ok_or_else(|| {
-                    Error::new(
-                        Phase::Build,
-                        ErrorKind::ServiceTypeMismatch {
-                            expected: std::any::type_name::<T>(),
-                            found: stored.type_name,
-                        },
-                    )
-                })?;
-                result.push(value);
+                result.push(
+                    stored
+                        .downcast_ref::<T>()
+                        .expect("collection key type matches stored value type"),
+                );
             }
         }
         Ok(result)
@@ -365,31 +325,16 @@ impl ServiceRegistry {
         let key = TypeId::of::<T>();
 
         if let Some(service) = self.services.get_mut(&key) {
-            return service.value.downcast_mut::<T>().ok_or_else(|| {
-                Error::new(
-                    Phase::Build,
-                    ErrorKind::ServiceTypeMismatch {
-                        expected: std::any::type_name::<T>(),
-                        found: service.type_name,
-                    },
-                )
-            });
+            return Ok(service
+                .downcast_mut::<T>()
+                .expect("service key type matches stored value type"));
         }
 
         if let Some(factory) = self.factories.get_mut(&key) {
-            let found = factory.type_name();
             return factory
                 .as_any_mut()
                 .downcast_mut::<TypedFactory<T>>()
-                .ok_or_else(|| {
-                    Error::new(
-                        Phase::Build,
-                        ErrorKind::ServiceTypeMismatch {
-                            expected: std::any::type_name::<T>(),
-                            found,
-                        },
-                    )
-                })?
+                .expect("factory key type matches stored factory type")
                 .get_mut();
         }
 
@@ -422,19 +367,9 @@ impl ServiceRegistry {
             )
         })?;
 
-        service
-            .value
+        Ok(*service
             .downcast::<T>()
-            .map(|value| *value)
-            .map_err(|_| {
-                Error::new(
-                    Phase::Build,
-                    ErrorKind::ServiceTypeMismatch {
-                        expected: std::any::type_name::<T>(),
-                        found: service.type_name,
-                    },
-                )
-            })
+            .expect("service key type matches stored value type"))
     }
 
     /// 注册表回滚快照：记录键集合与各集合当前长度。

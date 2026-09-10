@@ -1,6 +1,7 @@
 //! 核心错误类型。
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::plugin::PluginScope;
 
@@ -18,17 +19,12 @@ pub enum Phase {
 }
 
 /// 结构化错误种类。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ErrorKind {
     /// 服务已被注册过。
     ServiceAlreadyRegistered(String),
     /// 服务不存在。
     ServiceNotFound(String),
-    /// 服务类型不匹配。
-    ServiceTypeMismatch {
-        expected: &'static str,
-        found: &'static str,
-    },
     /// 插件名重复注册。
     PluginNameAlreadyRegistered(String),
     /// 插件依赖缺失。
@@ -41,7 +37,7 @@ pub enum ErrorKind {
         expected: PluginScope,
         actual: PluginScope,
     },
-    /// 父 Runtime 停止时仍有活跃子 Runtime（含活跃子作用域 id 清单）。
+    /// 父 Runtime 停止时仍有活跃子 Runtime / Builder（含活跃子作用域 id 清单）。
     ActiveScopes { count: u64, ids: Vec<usize> },
     /// 父已进入停止，拒绝新 scope / spawn。
     Stopping,
@@ -51,10 +47,19 @@ pub enum ErrorKind {
     SubscriptionNotFound,
     /// `Context::spawn` 时不存在可用的 tokio runtime 上下文。
     NoTaskRuntime,
-    /// `Context::spawn` 的后台任务 panic（仅在停止排空阶段上报）。
+    /// `Context::spawn` 的后台任务 panic。
+    ///
+    /// 两条上报路径：`Runtime::stop` 排空时计入停止错误；`TaskHandle::wait` 直接
+    /// 作为返回值。
     TaskFailed { task_id: u64 },
     /// 优雅停止超时，后台任务被强制取消。
     TaskAborted { task_id: u64 },
+    /// `start` 未能成功完成：重入一个已失败的运行时，或上一次启动被中断。
+    ///
+    /// 有根因时，聚合错误挂在 `source` 链上，可按
+    /// `err.source().and_then(|s| s.downcast_ref::<Error>())` 取回；
+    /// 启动被中途丢弃（没有记录到失败）时没有 `source`。
+    StartFailed,
     /// 承载插件自定义来源。
     Other,
     /// 停止/并行 start 的聚合错误。
@@ -62,6 +67,10 @@ pub enum ErrorKind {
 }
 
 /// Cordis 底层框架错误。
+///
+/// 可 `Clone`：`source` 是 `Arc`，克隆只增加引用计数。这让同一个失败可以在
+/// 交给调用方之外，再被 `Runtime` 保留一份（见 `ErrorKind::StartFailed`）。
+#[derive(Clone)]
 pub struct Error {
     /// 错误发生阶段。
     pub phase: Phase,
@@ -69,8 +78,9 @@ pub struct Error {
     pub plugin: Option<&'static str>,
     /// 错误种类。
     pub kind: ErrorKind,
-    /// 底层错误链。
-    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    /// 底层错误链。用 `Arc` 而非 `Box`：既让首错可被 Runtime 与重入错误共享，
+    /// 又保持 `with_source` 的公开签名与 `source()` 的返回类型不变。
+    source: Option<Arc<dyn std::error::Error + Send + Sync + 'static>>,
 }
 
 impl Error {
@@ -94,7 +104,7 @@ impl Error {
             phase,
             plugin: None,
             kind,
-            source: Some(Box::new(source)),
+            source: Some(Arc::new(source)),
         }
     }
 
@@ -146,13 +156,6 @@ impl fmt::Display for Error {
             ErrorKind::ServiceNotFound(name) => {
                 write!(f, "{:?}: service not found: {name}", self.phase)
             }
-            ErrorKind::ServiceTypeMismatch { expected, found } => {
-                write!(
-                    f,
-                    "{:?}: service type mismatch: expected {expected}, found {found}",
-                    self.phase
-                )
-            }
             ErrorKind::PluginNameAlreadyRegistered(name) => {
                 write!(
                     f,
@@ -198,6 +201,7 @@ impl fmt::Display for Error {
                     self.phase
                 )
             }
+            ErrorKind::StartFailed => write!(f, "{:?}: start did not complete", self.phase),
             ErrorKind::Other => write!(f, "{:?}: other error", self.phase),
             ErrorKind::Multiple(errors) => {
                 write!(f, "{:?}: multiple errors:", self.phase)?;
