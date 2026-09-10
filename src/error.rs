@@ -11,6 +11,11 @@ pub enum Phase {
     Apply,
     Verify,
     Build,
+    /// 运行期服务查询失败（`Context::require` 未命中）。
+    ///
+    /// 与 `Build` 区分开：同一个 `ServiceNotFound` 在装配期是注册错误、在运行期
+    /// 是查询失败，混用一个阶段会让排障无法定位。
+    Require,
     Start,
     Ready,
     Stop,
@@ -41,8 +46,6 @@ pub enum ErrorKind {
     ActiveScopes { count: u64, ids: Vec<usize> },
     /// 父已进入停止，拒绝新 scope / spawn。
     Stopping,
-    /// scope 数量超限。
-    TooManyScopes,
     /// 事件订阅不存在或不属于当前 Context。
     SubscriptionNotFound,
     /// `Context::spawn` 时不存在可用的 tokio runtime 上下文。
@@ -184,7 +187,6 @@ impl fmt::Display for Error {
                 write!(f, "{:?}: active scopes: {count}, ids: {ids:?}", self.phase)
             }
             ErrorKind::Stopping => write!(f, "{:?}: stopping", self.phase),
-            ErrorKind::TooManyScopes => write!(f, "{:?}: too many scopes", self.phase),
             ErrorKind::SubscriptionNotFound => {
                 write!(f, "{:?}: event subscription not found", self.phase)
             }

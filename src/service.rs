@@ -1,7 +1,7 @@
 //! 服务注册表。
 
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -372,41 +372,28 @@ impl ServiceRegistry {
             .expect("service key type matches stored value type"))
     }
 
-    /// 注册表回滚快照：记录键集合与各集合当前长度。
-    pub(crate) fn snapshot(&self) -> RegistrySnapshot {
-        RegistrySnapshot {
-            service_keys: self.services.keys().copied().collect(),
-            factory_keys: self.factories.keys().copied().collect(),
-            collection_lens: self
-                .collections
-                .iter()
-                .map(|(key, values)| (*key, values.len()))
-                .collect(),
-        }
+    // 以下三个方法是装配期增量回滚的唯一入口：注册表在插件 `apply` 期间的每次
+    // 新增都由调用方记录成一条逆操作，失败时按序撤销。此前用的「整表快照 + 重建」
+    // 需要复制全部键与长度，注册 N 个插件是 O(N·S)；增量撤销只与本次插件的改动量
+    // 相关。三个逆操作对「已删除的条目」都是幂等的，因此嵌套插件各自回滚不会误伤。
+
+    /// 撤销一次 `provide`：移除对应普通服务槽位。
+    pub(crate) fn remove_service_key(&mut self, key: TypeId) {
+        self.services.remove(&key);
     }
 
-    /// 回滚到指定快照：删除快照外的键，并将既有集合截断回快照长度。
-    pub(crate) fn restore(&mut self, snapshot: RegistrySnapshot) {
-        let RegistrySnapshot {
-            service_keys,
-            factory_keys,
-            collection_lens,
-        } = snapshot;
-        self.services.retain(|key, _| service_keys.contains(key));
-        self.factories.retain(|key, _| factory_keys.contains(key));
-        self.collections
-            .retain(|key, _| collection_lens.contains_key(key));
-        for (key, len) in collection_lens {
-            if let Some(values) = self.collections.get_mut(&key) {
-                values.truncate(len);
+    /// 撤销一次 `provide_factory`：移除对应工厂槽位。
+    pub(crate) fn remove_factory_key(&mut self, key: TypeId) {
+        self.factories.remove(&key);
+    }
+
+    /// 撤销一次 `provide_collect`：弹出该类型最后压入的元素，集合空后移除槽位。
+    pub(crate) fn pop_collection(&mut self, key: TypeId) {
+        if let Some(values) = self.collections.get_mut(&key) {
+            values.pop();
+            if values.is_empty() {
+                self.collections.remove(&key);
             }
         }
     }
-}
-
-/// 服务注册表回滚快照。
-pub(crate) struct RegistrySnapshot {
-    service_keys: HashSet<TypeId>,
-    factory_keys: HashSet<TypeId>,
-    collection_lens: HashMap<TypeId, usize>,
 }

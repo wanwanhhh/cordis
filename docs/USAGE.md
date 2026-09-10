@@ -40,7 +40,7 @@ tokio = { version = "1", features = ["rt", "time", "macros"] }
 cordis = { path = "../cordis", default-features = false }
 ```
 
-生命周期本身不绑定 async runtime——`Builder` / `Runtime` 的控制方法是普通 async fn，可用 `futures::executor`、`tokio`、`async-std` 等任意 executor 驱动；`Context::cancelled()` 同样与 runtime 无关，只有 `stop_with_timeout` 的排空计时依赖 `tokio::time`。
+生命周期本身不绑定 async runtime——`Builder` / `Runtime` 的控制方法是普通 async fn，可用 `futures::executor`、`tokio`、`async-std` 等任意 executor 驱动；`Context::cancelled()` 同样与 runtime 无关。**但 `Context::spawn` 与 `stop_with_timeout` 的排空计时只支持 tokio**：前者必须在 tokio runtime 上下文内调用，后者用 `tokio::time` 计时。框架当前不提供 executor 抽象。
 
 ---
 
@@ -283,7 +283,7 @@ fn apply(&self, cfg: &mut Configurator<'_>) -> Result<(), Error> {
 }
 ```
 
-回滚语义：`apply` 返回错误时，本次新增的服务、hooks、事件订阅与嵌套插件**整体回滚**，不会留下半初始化状态；错误信息中保留内层插件名。
+回滚语义：`apply` 返回错误**或 panic 展开**时，本次新增的服务、hooks、事件订阅与嵌套插件**整体回滚**，不会留下半初始化状态；错误信息中保留内层插件名。
 
 ---
 
@@ -381,7 +381,7 @@ builder.provide(Arc::new(DynamicValue::new(initial_config)))?;
 
 `provide_dynamic` 实际注册的是 `Arc<DynamicValue<T>>`，不占用原始 `T` 的服务槽位；子作用域也能通过父链读取同一个动态配置句柄。
 
-> 注意：`DynamicValue` 底层使用 `RwLock`。持锁线程 panic 造成的锁中毒被容忍（与框架其余部分一致）：`read` / `write` / `set` / `update` 获取中毒态锁并继续工作，返回中毒时刻的数据，不会把单次用户 panic 放大为读路径崩溃。
+> 注意：`DynamicValue` 底层使用 `RwLock`。持锁线程 panic 造成的锁中毒被容忍（与框架其余部分一致）：`read` / `write` / `set` / `update` 获取中毒态锁并继续工作，返回中毒时刻的数据，不会把单次用户 panic 放大为读路径崩溃。`read` / `write` 返回的是**锁守卫**（`Deref` / `DerefMut`）而不是数据快照：不要跨 `await` 持有（守卫非 `Send`，跨 `await` 会编译失败）；框架热路径无锁，但每次读动态配置都要拿一次 `RwLock`，成本由使用者自担。
 
 多字段需要同步变更时用 `write()` 拿独占引用，一次改完：
 
@@ -446,7 +446,7 @@ agent_rt.start().await?;
 - 子作用域可以遮蔽父级服务
 - 子作用域可以嵌套
 - `Context` 是只读句柄，没有 `provide` / `plugin` / `on` / `off` / `require_mut` / `start` / `stop`；`spawn` 只登记后台任务，不修改服务注册表
-- `Context::scope()` 返回 `Result<Builder, Error>`：父 `Runtime` 进入停止后返回 `ErrorKind::Stopping`；本层活跃子作用域计数达到上限（2^60 - 1，高位留给生命周期状态）时返回 `ErrorKind::TooManyScopes`
+- `Context::scope()` 返回 `Result<Builder, Error>`：父 `Runtime` 进入停止后返回 `ErrorKind::Stopping`
 - 停止可观测性、取消信号与后台任务见 5.2 / 5.3 / 5.4，可运行示例：`examples/tasks.rs`（子作用域与嵌套的作用域树另见 `examples/scopes.rs`）
 
 ### 5.1 c-lite 租约
@@ -759,9 +759,11 @@ pub struct Error {
 `Phase` 标注错误发生的生命周期阶段，全部取值：
 
 ```rust
-Phase::Apply | Phase::Verify | Phase::Build | Phase::Start
+Phase::Apply | Phase::Verify | Phase::Build | Phase::Require | Phase::Start
 Phase::Ready | Phase::Stop | Phase::Dispose | Phase::Event
 ```
+
+`Build` 与 `Require` 的区别：同一个 `ServiceNotFound`，装配期 `Builder::require` 失败报 `Build`，运行期 `Context::require` 失败报 `Require`，便于排障定位。
 
 构造与消费错误：
 
@@ -849,7 +851,6 @@ ErrorKind::PluginScopeMismatch {
 }
 ErrorKind::ActiveScopes { count, ids }
 ErrorKind::Stopping
-ErrorKind::TooManyScopes
 ErrorKind::NoTaskRuntime
 ErrorKind::TaskFailed { task_id }
 ErrorKind::TaskAborted { task_id }

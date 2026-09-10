@@ -272,6 +272,69 @@ mod tests {
     }
 
     #[test]
+    fn plugin_apply_panic_rolls_back_registration() {
+        struct BoomService;
+        struct Marker;
+
+        struct Boom;
+
+        #[async_trait]
+        impl Plugin for Boom {
+            fn name(&self) -> &'static str {
+                "boom"
+            }
+
+            fn apply(&self, cfg: &mut Configurator<'_>) -> Result<(), Error> {
+                cfg.provide(BoomService)?;
+                panic!("apply exploded");
+            }
+        }
+
+        struct BoomAgain;
+
+        #[async_trait]
+        impl Plugin for BoomAgain {
+            fn name(&self) -> &'static str {
+                "boom"
+            }
+        }
+
+        let mut builder = Builder::new();
+        builder.provide(Marker).unwrap();
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| builder.plugin(Boom)));
+        assert!(result.is_err(), "apply panic 必须原样向上传播");
+
+        // `apply` 期间注册的服务与占用的名字都已回滚，Builder 仍可继续使用。
+        assert!(!builder.contains::<BoomService>());
+        assert!(!builder.has_plugin("boom"));
+        builder.plugin(BoomAgain).unwrap();
+        assert!(builder.contains::<Marker>());
+
+        let mut rt = builder.build().unwrap();
+        block_on(rt.start()).unwrap();
+        block_on(rt.stop()).unwrap();
+    }
+
+    #[test]
+    fn runtime_require_reports_require_phase() {
+        #[derive(Debug)]
+        struct Missing;
+
+        let rt = Builder::new().build().unwrap();
+        let ctx = rt.handle();
+        let err = ctx.require::<Missing>().unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::ServiceNotFound(_)));
+        assert_eq!(err.phase, Phase::Require);
+
+        // 装配期查询失败仍是 Build 阶段，两者可区分。
+        let builder = Builder::new();
+        let err = builder.require::<Missing>().unwrap_err();
+        assert_eq!(err.phase, Phase::Build);
+    }
+
+    #[test]
     fn stop_continues_and_dispose_hook_always_runs() {
         let observed = Arc::new(Mutex::new(Vec::new()));
 
@@ -2635,18 +2698,21 @@ mod tests {
         tokio_block_on(async {
             let rt = Builder::new().build().unwrap();
             let ctx = rt.handle();
-            ctx.spawn(async { Ok::<(), Error>(()) }).unwrap();
-            ctx.spawn(async { Ok::<(), Error>(()) }).unwrap();
+            // 填到压缩阈值（`COMPACT_BASE`）：这些 cell 结束时都还留在表里。
+            for _ in 0..4 {
+                ctx.spawn(async { Ok::<(), Error>(()) }).unwrap();
+            }
             for _ in 0..1000 {
                 if ctx.task_count() == 0 {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
-            // `task_count` 会过滤已结束的，所以它证明不了「剪除」这件事——必须看
-            // 注册表原长：此刻两个已结束的 cell 都还在表里。
-            assert_eq!(ctx.registered_task_count(), 2);
-            // 再 spawn 一次才触发剪除，表里只剩这个新任务。
+            // `task_count` 会过滤已结束的，所以它证明不了「剪除」——必须看注册表
+            // 原长：此刻四个已结束的 cell 都还在表里（摊销压缩尚未触发）。
+            assert_eq!(ctx.registered_task_count(), 4);
+            // 再 spawn 一次使表长跨过阈值，触发一次压缩：已结束且无需上报的 cell
+            // 被剪除，表里只剩这个新任务。
             ctx.spawn(async { Ok::<(), Error>(()) }).unwrap();
             assert_eq!(ctx.registered_task_count(), 1);
         });
@@ -2664,9 +2730,11 @@ mod tests {
             // 等 panic 结局落定：它只等排空上报，没有事件出口。
             assert!(panicked.wait().await.is_err());
 
-            // 之后再 spawn 会触发剪除。未上报的 panic 结局必须被保住，否则 `stop`
-            // 会因为它之后又有人 spawn 过而静默报成功。
-            ctx.spawn(async { Ok::<(), Error>(()) }).unwrap();
+            // 把表长推过压缩阈值，触发一次剪除。未上报的 panic 结局必须被保住，
+            // 否则 `stop` 会因为它之后又有人 spawn 过而静默报成功。
+            for _ in 0..4 {
+                ctx.spawn(async { Ok::<(), Error>(()) }).unwrap();
+            }
 
             let err = rt.stop().await.unwrap_err();
             let ErrorKind::Multiple(errors) = err.kind else {

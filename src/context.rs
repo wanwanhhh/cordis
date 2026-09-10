@@ -18,7 +18,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 
 use crate::event::{ErasedEventHandler, Subscription, TypedEventHandler};
-use crate::service::{RegistrySnapshot, TypeMap};
+use crate::service::TypeMap;
 use crate::{
     DynamicValue, Error, ErrorKind, Event, EventControl, EventHandler, Phase, Plugin, PluginScope,
     ServiceRegistry,
@@ -26,64 +26,116 @@ use crate::{
 
 static NEXT_CONTEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// 状态编码：低 60 位是子作用域租约计数，高 4 位是生命周期状态。
-///
-/// 两者必须共处同一个原子字。`Context::scope()` 的「确认未停止 + 计数加一」
-/// 与 `Runtime::stop` 的「确认计数为零 + 转入 `Stopping`」都必须是**一次** CAS；
-/// 拆成两个字段会让这两步之间裂开竞态——父停止的同时长出子作用域。
-const COUNT_BITS: u32 = 60;
-const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
-const STATE_SHIFT: u32 = COUNT_BITS;
-
 /// 生命周期状态。
-///
-/// 判别式只用于编码（`to_bits` / `from_bits`），一切判断走显式 `matches!`，
-/// 不依赖数值大小顺序。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lifecycle {
     /// 已构建，尚未启动，也没有启动尝试。
-    Built = 0,
+    Built,
     /// 正在启动：已进入启动流程（`started_plugins` 开始记录）。
-    Starting = 1,
+    Starting,
     /// 启动成功。
-    Running = 2,
+    Running,
     /// 启动失败：已启动的插件仍待 `stop` 回收。与 `Running` 平行，不是终态。
-    Failed = 3,
+    Failed,
     /// owner 正在清理。可续跑：被丢弃的 `stop` future 会留在此态，重入继续。
-    Stopping = 4,
+    Stopping,
     /// 终态。
-    Stopped = 5,
+    Stopped,
 }
 
 impl Lifecycle {
-    /// 编码为状态位。计数位由调用方另行保留。
-    const fn to_bits(self) -> u64 {
-        (self as u64) << STATE_SHIFT
-    }
-
-    fn from_bits(state: u64) -> Self {
-        match (state >> STATE_SHIFT) & 0xF {
-            0 => Self::Built,
-            1 => Self::Starting,
-            2 => Self::Running,
-            3 => Self::Failed,
-            4 => Self::Stopping,
-            5 => Self::Stopped,
-            other => {
-                // 编码只由本模块写入 0..=5。其他值意味着状态位被越界破坏（典型是
-                // 租约计数下溢进位）：debug 构建下断言暴露。release 下取 `Failed`
-                // 而不是 `Stopped`——后者会让 `stop_impl` 直接返回 `Ok`，跳过插件
-                // stop 与 dispose，把「状态已损坏」伪装成「清理完成」，是这里最坏
-                // 的取值；`Failed` 会迫使 `stop` 照常回收，Drop 护栏也会报警。
-                debug_assert!(false, "invalid lifecycle encoding: {other}");
-                Self::Failed
-            }
-        }
-    }
-
     /// 拒绝新子作用域 / 新任务的状态。
     const fn is_shutting_down(self) -> bool {
         matches!(self, Self::Stopping | Self::Stopped)
+    }
+}
+
+/// 作用域门：生命周期状态与子作用域租约计数。
+///
+/// 两个判定必须一起成立：`Context::scope()` 的「父未停止 + 租约加一」，以及
+/// `Runtime::stop` 的「租约为零 + 转入 `Stopping`」。用两个独立原子会在它们之间
+/// 裂开「父停止的同时长出子作用域」的窗口。早期实现把状态与计数压进同一个
+/// `AtomicU64`、用一次 CAS 完成，正确但耦合了状态位与计数位，并由此长出「非法编码
+/// 兜底」「租约下溢断言」等一串不可达防御。`scope()` 与 `stop` 都是低频路径，改用
+/// 一把互斥锁在同一临界区内判定；热路径 `is_stopping()` 仍是单原子读。
+struct Gate {
+    inner: Mutex<GateState>,
+    /// `Stopping` / `Stopped` 的单向闩：置位后不再清除，供热路径无锁读取。
+    stopping: AtomicBool,
+}
+
+struct GateState {
+    lifecycle: Lifecycle,
+    leases: usize,
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(GateState {
+                lifecycle: Lifecycle::Built,
+                leases: 0,
+            }),
+            stopping: AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, GateState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lifecycle(&self) -> Lifecycle {
+        self.lock().lifecycle
+    }
+
+    /// 热路径判定：本层是否已进入关闭流程。单原子读，不拿锁。
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn lease_count(&self) -> usize {
+        self.lock().leases
+    }
+
+    fn set_lifecycle(&self, next: Lifecycle) {
+        let mut guard = self.lock();
+        guard.lifecycle = next;
+        if next.is_shutting_down() {
+            self.stopping.store(true, Ordering::Release);
+        }
+    }
+
+    /// 父未停止则登记一个子作用域租约。返回是否成功；失败意味着父已进入关闭流程。
+    ///
+    /// 判定与自增在同一临界区内完成，并与 `enter_stopping` 的「租约为零才迁移」
+    /// 互斥，因此不存在「父停止的同时长出子作用域」的窗口。
+    fn acquire_lease(&self) -> bool {
+        let mut guard = self.lock();
+        if guard.lifecycle.is_shutting_down() {
+            return false;
+        }
+        guard.leases += 1;
+        true
+    }
+
+    /// 归还租约。与 `acquire_lease` 由 `ScopeLease` 的 RAII 配对保证一一对应。
+    fn release_lease(&self) {
+        self.lock().leases -= 1;
+    }
+
+    /// 转入 `Stopping`；仍有租约时返回当前计数且不改动状态。
+    fn enter_stopping(&self) -> Result<(), usize> {
+        let mut guard = self.lock();
+        if guard.leases != 0 {
+            return Err(guard.leases);
+        }
+        guard.lifecycle = Lifecycle::Stopping;
+        drop(guard);
+        self.stopping.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -97,6 +149,9 @@ impl Lifecycle {
 /// 信号（排空与 `TaskHandle::wait` 共用）。
 struct Signal {
     fired: AtomicBool,
+    /// 本信号自己的等待者 token 分配器。token 只需在单个信号内唯一；独立计数
+    /// 避免全局原子在多核大量注册时争用同一缓存行。
+    token_seq: AtomicU64,
     waiters: Mutex<Vec<Waiter>>,
 }
 
@@ -111,19 +166,18 @@ struct Waiter {
     waker: Waker,
 }
 
-/// 等待者 token 分配器。只用于区分注册项，不承载语义。
-static NEXT_WAITER_TOKEN: AtomicU64 = AtomicU64::new(0);
-
-fn next_waiter_token() -> u64 {
-    NEXT_WAITER_TOKEN.fetch_add(1, Ordering::Relaxed)
-}
-
 impl Signal {
     const fn new() -> Self {
         Self {
             fired: AtomicBool::new(false),
+            token_seq: AtomicU64::new(0),
             waiters: Mutex::new(Vec::new()),
         }
+    }
+
+    /// 分配本信号内唯一的等待者 token。
+    fn next_token(&self) -> u64 {
+        self.token_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     #[cfg(feature = "tokio")]
@@ -187,7 +241,7 @@ impl Signal {
     fn wait(&self) -> Waiting<'_> {
         Waiting {
             signal: self,
-            token: next_waiter_token(),
+            token: self.next_token(),
             registered: false,
         }
     }
@@ -316,14 +370,15 @@ struct Data {
     context_id: usize,
     parent: Option<Arc<Data>>,
     services: ServiceRegistry,
-    plugin_names: Vec<&'static str>,
+    /// 插件名 -> `plugins` 索引。注册期查重与调度共用这一份索引。
+    plugin_index: HashMap<&'static str, usize>,
     /// 装配阶段的可变 handler 列表；`build` 时按事件类型分组进 `handlers_by_type`。
     event_handlers: Vec<Arc<dyn ErasedEventHandler>>,
     /// 冻结后的按事件类型分组表：emit 直接查表，避免每次全表扫描。
     /// 只在 `Runtime` 暴露的 `Context` 上读取，读取前必已冻结。
     handlers_by_type: TypeMap<Vec<Arc<dyn ErasedEventHandler>>>,
     next_subscription_id: usize,
-    state: AtomicU64,
+    gate: Gate,
     children: Mutex<Vec<usize>>,
     /// 本层停止信号：进入关闭流程（`enter_stopping`）或被显式请求时触发。
     cancellation: Signal,
@@ -337,11 +392,29 @@ struct Data {
 }
 
 #[cfg(feature = "tokio")]
-#[derive(Default)]
 struct TaskRegistry {
     tasks: Mutex<Vec<Arc<TaskCell>>>,
     next_id: AtomicU64,
+    /// 下一次压缩的触发长度。`spawn` 只在表长跨过它时做一次 O(n) 剪除，然后按
+    /// 实际长度翻倍；因此 n 次 spawn 的累计剪除代价是 O(n)，而不是每次 O(n) 的
+    /// O(n²)。
+    compact_at: AtomicUsize,
 }
+
+#[cfg(feature = "tokio")]
+impl Default for TaskRegistry {
+    fn default() -> Self {
+        Self {
+            tasks: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(0),
+            compact_at: AtomicUsize::new(COMPACT_BASE),
+        }
+    }
+}
+
+/// 任务表压缩阈值的初值与下限。
+#[cfg(feature = "tokio")]
+const COMPACT_BASE: usize = 4;
 
 /// 单个后台任务的共享控制块。
 ///
@@ -507,11 +580,11 @@ impl Data {
             context_id: NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed),
             parent,
             services: ServiceRegistry::new(),
-            plugin_names: Vec::new(),
+            plugin_index: HashMap::new(),
             event_handlers: Vec::new(),
             handlers_by_type: TypeMap::default(),
             next_subscription_id: 0,
-            state: AtomicU64::new(0),
+            gate: Gate::new(),
             children: Mutex::new(Vec::new()),
             cancellation: Signal::new(),
             stop_requested: AtomicBool::new(false),
@@ -602,7 +675,8 @@ impl Data {
     }
 
     fn has_plugin(&self, name: &str) -> bool {
-        self.chain().any(|data| data.plugin_names.contains(&name))
+        self.chain()
+            .any(|data| data.plugin_index.contains_key(name))
     }
 
     /// [`Context::cancelled`] / [`StopHandle::cancelled`] 的轮询实现。
@@ -611,7 +685,7 @@ impl Data {
     /// 必定唤醒已注册的等待者），所以这里复查状态是一个**免锁快路径**：已经进入
     /// 停止的等待者不必去抢 `Signal` 的锁就能立刻就绪。
     fn poll_cancelled(&self, token: u64, waker: &Waker) -> Poll<()> {
-        if Lifecycle::from_bits(self.state.load(Ordering::Acquire)).is_shutting_down() {
+        if self.gate.is_stopping() {
             return Poll::Ready(());
         }
         self.cancellation.poll(token, waker)
@@ -631,15 +705,37 @@ impl Data {
     }
 }
 
-type Snapshot = (
-    RegistrySnapshot,
-    usize,
-    usize,
-    usize,
-    usize,
-    Vec<Arc<dyn ErasedEventHandler>>,
-    usize,
-);
+/// 装配期回滚检查点：`undo` 的截断位置 + 订阅号计数。
+///
+/// 只记录「从哪里开始撤销」，不复制任何表。回滚代价与本次 `plugin()` 期间的改动量
+/// 成正比，而不是与注册表 / 事件表的总规模成正比。
+#[derive(Clone, Copy)]
+struct Checkpoint {
+    undo: usize,
+    next_subscription_id: usize,
+}
+
+/// 单条装配期逆操作。
+///
+/// 每条由一次具体的注册动作产生，回滚时逆序重放。逆操作对「已被内层回滚删掉的
+/// 条目」幂等（`remove` 已删键、`pop` 空集合都是 no-op），因此嵌套 `plugin()` 各自
+/// 持检查点时不会互相误伤。`provide_collect` 的逆操作是「弹出最后一个元素」而非
+/// 「删除整个槽位」，所以回滚一个插件不会误删其他插件向同一集合追加的元素。
+enum UndoOp {
+    RemoveService(TypeId),
+    RemoveFactory(TypeId),
+    PopCollection(TypeId),
+    PopHandler,
+    /// `off` 从中间删除的 handler：连下标一起记下，回滚时原位放回。
+    RestoreHandler {
+        index: usize,
+        handler: Arc<dyn ErasedEventHandler>,
+    },
+    PopPlugin,
+    RemovePluginName(&'static str),
+    PopReady,
+    PopDispose,
+}
 
 /// 缓存插件注册时求值的依赖信息。
 struct PluginRecord {
@@ -659,6 +755,7 @@ impl PluginRecord {
 }
 
 /// 从同一张依赖图一次算出的启动调度：串行拓扑序与可并发分层。
+#[derive(Default)]
 struct Schedule {
     /// 串行启动顺序（`start_serial` 与停止逆序的基准）。
     order: Vec<usize>,
@@ -676,23 +773,17 @@ struct Schedule {
 /// 环检测只在 Kahn 贪心选点阶段发生一次。
 fn compute_schedule(
     plugins: &[PluginRecord],
-    local_names: &[&'static str],
+    local_index: &HashMap<&'static str, usize>,
     has_plugin: impl Fn(&str) -> bool,
 ) -> Result<Schedule, Error> {
     let n = plugins.len();
-
-    // 插件名 -> 索引。名字唯一性由注册阶段保证。
-    let mut position: HashMap<&'static str, usize> = HashMap::with_capacity(n);
-    for (index, name) in local_names.iter().enumerate() {
-        position.insert(*name, index);
-    }
 
     let mut indegree = vec![0usize; n];
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
 
     for (i, record) in plugins.iter().enumerate() {
         for plugin_dependency in &record.plugin_deps {
-            match position.get(plugin_dependency.plugin_name) {
+            match local_index.get(plugin_dependency.plugin_name) {
                 Some(&j) => {
                     dependents[j].push(i);
                     indegree[i] += 1;
@@ -766,19 +857,14 @@ struct ScopeLease {
 
 impl Drop for ScopeLease {
     fn drop(&mut self) {
+        // 先摘除子 id 再归还租约：父 `stop` 只会观察到「计数已归零」这一种完成态，
+        // 不会看到「计数为零但清单里仍有条目」。
         self.parent
             .children
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|id| *id != self.child_id);
-        let previous = self.parent.state.fetch_sub(1, Ordering::SeqCst);
-        // 租约与计数一一对应：本 lease 存活期间父计数必 >= 1。若观察到 0，说明
-        // 不变式已被破坏，而减法会下溢到状态位、把生命周期编码污染成非法值，
-        // 后果是静默的。借 `fetch_sub` 的返回值断言，release 下零额外开销。
-        debug_assert!(
-            previous & COUNT_MASK > 0,
-            "scope lease underflow: parent state = {previous:#x}"
-        );
+        self.parent.gate.release_lease();
     }
 }
 
@@ -789,6 +875,8 @@ pub struct Builder {
     ready: Vec<ReadyHook>,
     dispose: Vec<DisposeHook>,
     lease: Option<ScopeLease>,
+    /// 装配期逆操作日志；见 [`UndoOp`]。
+    undo: Vec<UndoOp>,
 }
 
 impl Builder {
@@ -800,6 +888,7 @@ impl Builder {
             ready: Vec::new(),
             dispose: Vec::new(),
             lease: None,
+            undo: Vec::new(),
         }
     }
 
@@ -817,6 +906,7 @@ impl Builder {
             ready: Vec::new(),
             dispose: Vec::new(),
             lease: Some(ScopeLease { parent, child_id }),
+            undo: Vec::new(),
         }
     }
 
@@ -841,35 +931,45 @@ impl Builder {
         self.data.context_id
     }
 
-    fn snapshot(&self) -> Snapshot {
-        (
-            self.data.services.snapshot(),
-            self.plugins.len(),
-            self.data.plugin_names.len(),
-            self.ready.len(),
-            self.dispose.len(),
-            self.data.event_handlers.clone(),
-            self.data.next_subscription_id,
-        )
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            undo: self.undo.len(),
+            next_subscription_id: self.data.next_subscription_id,
+        }
     }
 
-    fn restore(&mut self, snapshot: Snapshot) {
-        let (
-            registry,
-            plugin_len,
-            plugin_names_len,
-            ready_len,
-            dispose_len,
-            event_handlers,
-            next_subscription_id,
-        ) = snapshot;
-        self.data.services.restore(registry);
-        self.plugins.truncate(plugin_len);
-        self.data.plugin_names.truncate(plugin_names_len);
-        self.ready.truncate(ready_len);
-        self.dispose.truncate(dispose_len);
-        self.data.event_handlers = event_handlers;
-        self.data.next_subscription_id = next_subscription_id;
+    /// 逆序重放 `undo` 到检查点，并恢复订阅号计数。
+    fn rollback(&mut self, checkpoint: Checkpoint) {
+        while self.undo.len() > checkpoint.undo {
+            match self
+                .undo
+                .pop()
+                .expect("undo log non-empty above checkpoint")
+            {
+                UndoOp::RemoveService(key) => self.data.services.remove_service_key(key),
+                UndoOp::RemoveFactory(key) => self.data.services.remove_factory_key(key),
+                UndoOp::PopCollection(key) => self.data.services.pop_collection(key),
+                UndoOp::PopHandler => {
+                    self.data.event_handlers.pop();
+                }
+                UndoOp::RestoreHandler { index, handler } => {
+                    self.data.event_handlers.insert(index, handler);
+                }
+                UndoOp::PopPlugin => {
+                    self.plugins.pop();
+                }
+                UndoOp::RemovePluginName(name) => {
+                    self.data.plugin_index.remove(name);
+                }
+                UndoOp::PopReady => {
+                    self.ready.pop();
+                }
+                UndoOp::PopDispose => {
+                    self.dispose.pop();
+                }
+            }
+        }
+        self.data.next_subscription_id = checkpoint.next_subscription_id;
     }
 
     /// 注册一个插件。
@@ -899,31 +999,44 @@ impl Builder {
         let deps = plugin.dependencies();
         let plugin_deps = plugin.plugin_dependencies();
 
-        if self.data.plugin_names.contains(&name) {
+        if self.data.plugin_index.contains_key(name) {
             return Err(Error::new(
                 Phase::Build,
                 ErrorKind::PluginNameAlreadyRegistered(name.to_string()),
             ));
         }
 
-        let snapshot = self.snapshot();
+        let checkpoint = self.checkpoint();
 
-        let apply_result = {
-            let mut cfg = Configurator { builder: self };
-            plugin.apply(&mut cfg)
+        // `apply` 是同步的纯注册过程。用 `catch_unwind` 让「回滚」对返回 `Err` 与
+        // panic 展开两种失败方式都成立：panic 仍原样向上传播（`resume_unwind`），
+        // 不降级成 `Err`、不吞掉 panic 语义，只是多跑一次与 `Err` 路径完全相同的
+        // undo。回滚的正确性依赖「undo 覆盖 apply 的全部副作用」，因此每个
+        // `Configurator` 写方法都必须同步记录逆操作。
+        let apply_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            plugin.apply(&mut Configurator { builder: self })
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                self.rollback(checkpoint);
+                std::panic::resume_unwind(payload);
+            }
         };
 
         if let Err(err) = apply_result {
-            self.restore(snapshot);
+            self.rollback(checkpoint);
             return Err(err.into_phase(Phase::Apply, Some(name)));
         }
 
+        let index = self.plugins.len();
         self.plugins.push(PluginRecord {
             plugin: Box::new(plugin),
             deps,
             plugin_deps,
         });
-        self.data.plugin_names.push(name);
+        self.data.plugin_index.insert(name, index);
+        self.undo.push(UndoOp::PopPlugin);
+        self.undo.push(UndoOp::RemovePluginName(name));
         Ok(())
     }
 
@@ -948,11 +1061,11 @@ impl Builder {
         P: Plugin,
         C: Send + Sync + 'static,
     {
-        let registry = self.data.services.snapshot();
+        let checkpoint = self.checkpoint();
         self.provide(config)?;
 
         if let Err(err) = self.plugin(plugin) {
-            self.data.services.restore(registry);
+            self.rollback(checkpoint);
             return Err(err);
         }
 
@@ -961,7 +1074,9 @@ impl Builder {
 
     /// 注册服务。
     pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
-        self.data.services.provide(value)
+        self.data.services.provide(value)?;
+        self.undo.push(UndoOp::RemoveService(TypeId::of::<T>()));
+        Ok(())
     }
 
     /// 注册一个懒加载服务工厂。
@@ -969,12 +1084,16 @@ impl Builder {
         &mut self,
         factory: impl Fn() -> Result<T, Error> + Send + Sync + 'static,
     ) -> Result<(), Error> {
-        self.data.services.provide_factory(factory)
+        self.data.services.provide_factory(factory)?;
+        self.undo.push(UndoOp::RemoveFactory(TypeId::of::<T>()));
+        Ok(())
     }
 
     /// 注册一个集合服务实现。
     pub fn provide_collect<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
-        self.data.services.provide_collect(value)
+        self.data.services.provide_collect(value)?;
+        self.undo.push(UndoOp::PopCollection(TypeId::of::<T>()));
+        Ok(())
     }
 
     /// 注册一个运行时动态配置服务。
@@ -1031,12 +1150,14 @@ impl Builder {
     /// 注册一个 ready 回调。
     pub fn on_ready(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
         self.ready.push(Box::new(hook));
+        self.undo.push(UndoOp::PopReady);
         Ok(())
     }
 
     /// 注册一个 dispose 回调。
     pub fn on_dispose(&mut self, hook: impl LifecycleHook) -> Result<(), Error> {
         self.dispose.push(Box::new(hook));
+        self.undo.push(UndoOp::PopDispose);
         Ok(())
     }
 
@@ -1051,6 +1172,7 @@ impl Builder {
         self.data
             .event_handlers
             .push(Arc::new(TypedEventHandler::new(id, handler)));
+        self.undo.push(UndoOp::PopHandler);
         Ok(Subscription {
             context_id: self.data.context_id,
             handler_id: id,
@@ -1069,7 +1191,8 @@ impl Builder {
             .iter()
             .position(|handler| handler.id() == subscription.handler_id)
         {
-            self.data.event_handlers.remove(index);
+            let handler = self.data.event_handlers.remove(index);
+            self.undo.push(UndoOp::RestoreHandler { index, handler });
             Ok(())
         } else {
             Err(Error::new(Phase::Build, ErrorKind::SubscriptionNotFound))
@@ -1078,11 +1201,19 @@ impl Builder {
 
     /// 校验依赖：服务依赖、插件依赖和环。
     pub fn verify(&self) -> Result<(), Error> {
-        self.verify_dependencies()
+        self.validate().map(|_| ())
     }
 
     /// 校验所有插件的依赖是否满足。
     pub fn verify_dependencies(&self) -> Result<(), Error> {
+        self.validate().map(|_| ())
+    }
+
+    /// 校验服务依赖并算出启动调度。
+    ///
+    /// 调度只在这里算一次，随 [`Runtime`] 保存；`start` 直接取用，既不会重复计算，
+    /// 也不存在「已通过校验的 Runtime 在 start 时调度失败」的不可达错误分支。
+    fn validate(&self) -> Result<Schedule, Error> {
         for record in &self.plugins {
             for dependency in &record.deps {
                 if !dependency.optional && !self.data.contains_type(dependency.type_id) {
@@ -1095,14 +1226,12 @@ impl Builder {
         }
 
         // 插件依赖的存在性检查不在这里做：`compute_schedule` 是唯一依赖解析入口，
-        // 它已经对每个插件的每条 plugin_dep 做了同样判断、报同样的错误。这里再写
-        // 一遍就是两份需要同步的实现。
-        self.compute_schedule()?;
-        Ok(())
+        // 它已经对每个插件的每条 plugin_dep 做了同样判断、报同样的错误。
+        self.compute_schedule()
     }
 
     fn compute_schedule(&self) -> Result<Schedule, Error> {
-        compute_schedule(&self.plugins, &self.data.plugin_names, |name| {
+        compute_schedule(&self.plugins, &self.data.plugin_index, |name| {
             self.data.has_plugin(name)
         })
     }
@@ -1111,18 +1240,19 @@ impl Builder {
     ///
     /// 冻结点是唯一一次 `Arc::new(data)`。
     pub fn build(self) -> Result<Runtime, Error> {
-        self.verify()?;
-        Ok(self.build_validated())
+        let schedule = self.validate()?;
+        Ok(self.build_validated(schedule))
     }
 
     /// 假定校验已通过的内部构造；`build` 与 `try_build` 共用，校验只跑一遍。
-    fn build_validated(self) -> Runtime {
+    fn build_validated(self, schedule: Schedule) -> Runtime {
         let Builder {
             data,
             plugins,
             ready,
             dispose,
             lease,
+            undo: _,
         } = self;
 
         let mut data = data;
@@ -1139,6 +1269,8 @@ impl Builder {
             stop_progress: None,
             start_error: None,
             stop_errors: Vec::new(),
+            schedule,
+            active: AtomicBool::new(false),
             _lease: lease,
         }
     }
@@ -1146,11 +1278,10 @@ impl Builder {
     /// 消费 Builder；校验失败时把 Builder（含租约）完整带回。
     #[allow(clippy::result_large_err)]
     pub fn try_build(self) -> Result<Runtime, (Builder, Error)> {
-        if let Err(err) = self.verify() {
-            return Err((self, err));
+        match self.validate() {
+            Ok(schedule) => Ok(self.build_validated(schedule)),
+            Err(err) => Err((self, err)),
         }
-
-        Ok(self.build_validated())
     }
 }
 
@@ -1284,25 +1415,10 @@ impl Context {
     /// 该方法会在父 `Data.state` 上原子的递增 child 计数；若父已进入停止，
     /// 返回 `ErrorKind::Stopping`。
     pub fn scope(&self) -> Result<Builder, Error> {
-        loop {
-            let s = self.inner.state.load(Ordering::Acquire);
-            if Lifecycle::from_bits(s).is_shutting_down() {
-                return Err(Error::new(Phase::Build, ErrorKind::Stopping));
-            }
-            if s & COUNT_MASK == COUNT_MASK {
-                return Err(Error::new(Phase::Build, ErrorKind::TooManyScopes));
-            }
-            match self.inner.state.compare_exchange_weak(
-                s,
-                s + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    return Ok(Builder::child(self.inner.clone()));
-                }
-                Err(_) => continue,
-            }
+        if self.inner.gate.acquire_lease() {
+            Ok(Builder::child(self.inner.clone()))
+        } else {
+            Err(Error::new(Phase::Build, ErrorKind::Stopping))
         }
     }
 
@@ -1331,7 +1447,10 @@ impl Context {
 
     /// 获取服务引用。
     pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T, Error> {
-        self.inner.require()
+        // 运行期查询失败与装配期注册错误区分开，见 `Phase::Require`。
+        self.inner
+            .require()
+            .map_err(|err| err.into_phase(Phase::Require, None))
     }
 
     /// 判断服务是否存在（局部 + 父级）。
@@ -1346,7 +1465,7 @@ impl Context {
 
     /// 本层是否已经拒绝新工作（`Stopping` / `Stopped`）。
     fn shutting_down(&self) -> bool {
-        Lifecycle::from_bits(self.inner.state.load(Ordering::Acquire)).is_shutting_down()
+        self.inner.gate.is_stopping()
     }
 
     /// 本层 Context 的稳定 id（进程内全局唯一）。
@@ -1375,8 +1494,8 @@ impl Context {
     /// 不要求 tokio 上下文，可在任意 executor 上使用。
     pub fn cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
         Cancelled {
+            token: self.inner.cancellation.next_token(),
             inner: self.inner.clone(),
-            token: next_waiter_token(),
             registered: false,
         }
     }
@@ -1428,10 +1547,15 @@ impl Context {
         if self.shutting_down() {
             return Err(Error::new(Phase::Build, ErrorKind::Stopping));
         }
-        // 剪除已结束的 cell，给表一个内存边界。但必须保住「排空仍需上报」的结局
-        // （目前只有 panic）：若按 `is_finished()` 盲删，一条 panic 会因为它之后
-        // 又有人 `spawn` 过而被静默丢掉，`stop` 反而报成功。
-        tasks.retain(|task| !task.is_finished() || task.needs_drain_report());
+        // 摊销剪除：只在表长跨过阈值时做一次 O(n) 清理，然后按实际长度翻倍，n 次
+        // spawn 的累计代价是 O(n)。剪除必须保住「排空仍需上报」的结局（panic 与
+        // 排空超时取消）：按 `is_finished()` 盲删会让一条 panic 因为它之后又有人
+        // `spawn` 过而被静默丢掉，`stop` 反而报成功。
+        if tasks.len() >= self.inner.tasks.compact_at.load(Ordering::Relaxed) {
+            tasks.retain(|task| !task.is_finished() || task.needs_drain_report());
+            let next = (tasks.len().saturating_mul(2)).max(COMPACT_BASE);
+            self.inner.tasks.compact_at.store(next, Ordering::Relaxed);
+        }
         let id = self.inner.tasks.next_id.fetch_add(1, Ordering::Relaxed);
 
         let cell = Arc::new(TaskCell {
@@ -1530,7 +1654,7 @@ impl Context {
     /// 测试用：读取本层活跃子 Runtime/Builder 的租约计数。
     #[cfg(test)]
     pub(crate) fn child_count(&self) -> u64 {
-        self.inner.state.load(Ordering::SeqCst) & COUNT_MASK
+        self.inner.gate.lease_count() as u64
     }
 
     /// 串行发出事件，并沿父链向上冒泡。
@@ -1689,8 +1813,8 @@ impl StopHandle {
     /// 等待停止信号；语义与 [`Context::cancelled`] 相同。
     pub fn cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
         Cancelled {
+            token: self.inner.cancellation.next_token(),
             inner: self.inner.clone(),
-            token: next_waiter_token(),
             registered: false,
         }
     }
@@ -1792,6 +1916,11 @@ pub struct Runtime {
     start_error: Option<Error>,
     /// `stop` 累积的错误，跨重入保留，进入 `Stopped` 时随返回值交出。
     stop_errors: Vec<Error>,
+    /// `build()` 一次算出的启动调度；`start` 取用后清空。
+    schedule: Schedule,
+    /// 是否处于「已进入启动流程但尚未到 `Stopped`」。只服务 `Drop` 诊断，不参与
+    /// 状态判定，因此是单原子读写、不拿 `Gate` 锁。
+    active: AtomicBool,
     /// 私有租约必须作为最后一个字段声明，确保在插件字段析构之后归还父计数。
     #[allow(dead_code)]
     _lease: Option<ScopeLease>,
@@ -1815,7 +1944,7 @@ impl Runtime {
 
     /// 当前生命周期状态。真值源是 `Data.state`，本地不保留副本。
     fn lifecycle(&self) -> Lifecycle {
-        Lifecycle::from_bits(self.ctx.inner.state.load(Ordering::SeqCst))
+        self.ctx.inner.gate.lifecycle()
     }
 
     /// 只替换状态位，保留子作用域租约计数。
@@ -1823,13 +1952,7 @@ impl Runtime {
     /// 用 `fetch_update` 而非 `store`：计数会被 `Context::scope()` 与
     /// `ScopeLease::drop` 并发修改，读改写必须循环 CAS，否则丢更新。
     fn set_lifecycle(&self, next: Lifecycle) {
-        let _ = self
-            .ctx
-            .inner
-            .state
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
-                Some((state & COUNT_MASK) | next.to_bits())
-            });
+        self.ctx.inner.gate.set_lifecycle(next);
     }
 
     /// 首次启动失败的聚合错误；从未失败时为 `None`。
@@ -1839,15 +1962,16 @@ impl Runtime {
         self.start_error.as_ref()
     }
 
-    /// 构造「上次启动未成功完成」的错误，有根因时挂在 `source` 链上。
+    /// 构造「上次启动未成功完成」的错误，根因挂在 `source` 链上。
+    ///
+    /// `Failed` 只由 `start_with` 在写入 `start_error` 之后设置，且生命周期是一个
+    /// 普通枚举、不会被破坏成非法值，因此这里必有根因——不再需要「无根因兜底」。
     fn start_failed_error(&self) -> Error {
-        // 正常路径下 `Failed` 必然已写入 `start_error`（见 `start_with`）。但
-        // `from_bits` 的损坏兜底也会产出 `Failed`，那时没有根因——不能因此 panic，
-        // 退化成不带 `source` 的 `StartFailed`（与 `Starting` 中断同一形态）。
-        match self.start_error.as_ref() {
-            Some(first) => Error::with_source(Phase::Start, ErrorKind::StartFailed, first.clone()),
-            None => Error::new(Phase::Start, ErrorKind::StartFailed),
-        }
+        let first = self
+            .start_error
+            .as_ref()
+            .expect("Failed implies start_error recorded");
+        Error::with_source(Phase::Start, ErrorKind::StartFailed, first.clone())
     }
 
     async fn start_with(&mut self, serial: bool) -> Result<(), Error> {
@@ -1867,9 +1991,10 @@ impl Runtime {
             Lifecycle::Built => {}
         }
 
-        // 单一依赖图同时给出串行序与并行层。调度失败停在 `Built`：一个插件都没
-        // 启动，`stop` 不需要回收任何东西。
-        let schedule = self.compute_schedule()?;
+        // 调度在 `build()` 已算好并随 Runtime 保存；`start` 直接取用，没有失败分支，
+        // 也不存在「已通过校验的 Runtime 在 start 时调度失败」的不可达错误路径。
+        let schedule = std::mem::take(&mut self.schedule);
+        self.active.store(true, Ordering::Release);
         self.set_lifecycle(Lifecycle::Starting);
 
         let mut errors = Vec::new();
@@ -1940,12 +2065,6 @@ impl Runtime {
     /// 保留旧语义的串行启动。
     pub async fn start_serial(&mut self) -> Result<(), Error> {
         self.start_with(true).await
-    }
-
-    fn compute_schedule(&self) -> Result<Schedule, Error> {
-        compute_schedule(&self.plugins, &self.ctx.inner.plugin_names, |name| {
-            self.ctx.inner.has_plugin(name)
-        })
     }
 
     /// 异步停止。
@@ -2032,6 +2151,7 @@ impl Runtime {
         self.stop_progress = None;
         self.started_plugins.clear();
         self.set_lifecycle(Lifecycle::Stopped);
+        self.active.store(false, Ordering::Release);
 
         let errors = std::mem::take(&mut self.stop_errors);
         if errors.is_empty() {
@@ -2046,33 +2166,21 @@ impl Runtime {
     /// 期望值必须是从 `state` 读出的**完整快照**（状态位 + 计数位），不能沿用
     /// 常量 `0`——状态位落地后 `0` 只表示 `Built` 且无子作用域。
     fn enter_stopping(&mut self) -> Result<(), Error> {
-        loop {
-            let state = self.ctx.inner.state.load(Ordering::SeqCst);
-            let count = state & COUNT_MASK;
-            if count != 0 {
-                return Err(Error::new(
-                    Phase::Stop,
-                    ErrorKind::ActiveScopes {
-                        count,
-                        ids: self.ctx.children(),
-                    },
-                ));
+        match self.ctx.inner.gate.enter_stopping() {
+            Ok(()) => {
+                // 进入关闭流程即广播，且必须早于插件 `stop` 与任务排空：长驻任务
+                // 因此有窗口在 dispose 之前自己收尾，而不是等排空来踢。`stopping`
+                // 闩已在 `enter_stopping` 内先于本行置位（Release）。
+                self.ctx.inner.cancellation.fire();
+                Ok(())
             }
-            match self.ctx.inner.state.compare_exchange_weak(
-                state,
-                Lifecycle::Stopping.to_bits(),
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    // 进入关闭流程即广播，且必须早于插件 `stop` 与任务排空：长驻任务
-                    // 因此有窗口在 dispose 之前自己收尾，而不是等排空来踢。重入
-                    // （`Stopping` 分支）不会走到这里，但 `fire` 本身也幂等。
-                    self.ctx.inner.cancellation.fire();
-                    return Ok(());
-                }
-                Err(_) => continue,
-            }
+            Err(count) => Err(Error::new(
+                Phase::Stop,
+                ErrorKind::ActiveScopes {
+                    count: count as u64,
+                    ids: self.ctx.children(),
+                },
+            )),
         }
     }
 
@@ -2162,14 +2270,7 @@ impl Drop for Runtime {
         // 展开。Drop 里再 panic 会二次 panic 并 abort，连原始 panic 信息一起吞掉，
         // 因此展开路径只放行。
         debug_assert!(
-            std::thread::panicking()
-                || !matches!(
-                    Lifecycle::from_bits(self.ctx.inner.state.load(Ordering::SeqCst)),
-                    Lifecycle::Starting
-                        | Lifecycle::Running
-                        | Lifecycle::Failed
-                        | Lifecycle::Stopping
-                ),
+            std::thread::panicking() || !self.active.load(Ordering::Acquire),
             "Runtime dropped without stop(): plugin resources and dispose hooks \
              were not reclaimed"
         );

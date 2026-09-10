@@ -44,7 +44,7 @@ Context                   // require / require_all_recursive / contains / has_pl
 
 #### 生命周期状态机
 
-生命周期状态**没有本地副本**，唯一真值源是 `Data.state` 的同一个原子字：低 60 位是子作用域租约计数，高 4 位是状态（二者同字的原因见 §3.2）。
+生命周期状态**没有本地副本**，唯一真值源是 `Gate` 中 `Mutex<GateState>` 保护的 `{ lifecycle, leases }`（两者需在同一临界区判定的原因见 §3.2）。热路径 `is_stopping()` 读 `Gate` 的 `AtomicBool` 单向闩，不拿锁。
 
 ```text
 Built ──start──▶ Starting ──成功──▶ Running
@@ -92,7 +92,7 @@ Built ──start──▶ Starting ──成功──▶ Running
 let child: Builder = ctx.scope()?;
 ```
 
-`Context::scope()` 在父 `Data.state` 上原子递增 child 计数。父 `Runtime` 已停止时返回 `ErrorKind::Stopping`；计数达到上限（2^60 - 1，高位留给生命周期状态）时返回 `ErrorKind::TooManyScopes`。
+`Context::scope()` 在父 `Gate` 的临界区内登记一个子作用域租约。父 `Runtime` 已停止时返回 `ErrorKind::Stopping`；租约是 `usize`，不存在可实际触及的上限。
 
 ### 3.2 租约
 
@@ -101,7 +101,7 @@ let child: Builder = ctx.scope()?;
 - 只在 `Runtime` / `Builder` 的字段析构阶段释放，绝不在 `stop()` 成功路径释放。
 - `Runtime` 中 `_lease` 必须是最后一个字段，保证插件字段先析构、再归还父计数。
 - `ScopeLease::drop` 先把本层 id 从父注册表摘除，再 `fetch_sub(1, SeqCst)` 归还父计数。
-- **计数与生命周期状态共用父 `Data.state` 的同一个 u64**（低 60 位计数、高 4 位状态）。这不是编码风格问题：`Context::scope()` 的「确认未停止 + 计数加一」与 `Runtime::stop` 的「确认计数为零 + 转入 `Stopping`」都必须是一次 CAS，拆成两个字段会在两步之间裂开竞态——父停止的同时长出子作用域。
+- **计数与生命周期状态共用父 `Gate` 的同一把锁**。这不是编码风格问题：`Context::scope()` 的「确认未停止 + 租约加一」与 `Runtime::stop` 的「确认租约为零 + 转入 `Stopping`」必须在同一临界区判定，拆成两个独立原子会在两步之间裂开竞态——父停止的同时长出子作用域。（早期实现用单个 `AtomicU64` 位打包 + 一次 CAS，现已改为互斥锁；`scope` / `stop` 都是低频路径，热路径仍是单原子读。）
 
 ### 3.3 父 stop 与子存活
 
@@ -138,10 +138,10 @@ let child: Builder = ctx.scope()?;
 
 - 要求当前线程处于 tokio runtime 上下文，否则返回 `ErrorKind::NoTaskRuntime`。
 - 任务输出必须是 `Result<(), Error>`；返回 `Err` 时以 `emit_notify` 发出 `TaskFailed` 事件（沿父链冒泡）。
-- 注册表在每次 `spawn` 时惰性剪除已结束的 cell（内存边界），但**保住「排空仍需上报」的结局**（`needs_drain_report` 覆盖 `Panicked` 与 `AbortedByTimeout`；其中后者总在同一轮被取出，实际能驻留到下次 `spawn` 的只有 panic）：按 `is_finished` 盲删会让一条 panic 因为它之后又有人 `spawn` 过而被静默丢掉，`stop` 反而报成功。`task_count()` 只统计不剪除，同理——剪除会销毁尚未上报的结局。本层进入停止后 `spawn` 返回 `ErrorKind::Stopping`。
+- 注册表在 `spawn` 时**摊销剪除**已结束的 cell（内存边界）：仅当表长跨过 `compact_at` 阈值时做一次 `retain`，随后阈值按实际长度翻倍，n 次 `spawn` 累计 O(n)。剪除**保住「排空仍需上报」的结局**（`needs_drain_report` 覆盖 `Panicked` 与 `AbortedByTimeout`）：按 `is_finished` 盲删会让一条 panic 因为它之后又有人 `spawn` 过而被静默丢掉，`stop` 反而报成功。`task_count()` 只统计不剪除，同理——剪除会销毁尚未上报的结局。本层进入停止后 `spawn` 返回 `ErrorKind::Stopping`。
 - 注册表元素是 `Arc<TaskCell>`，与 `TaskHandle` 共享：cell 持 `AbortHandle` + 完成信号 + 结局。**不保存 `JoinHandle`**——旧实现为此不得不在 `Runtime` 上挂 `draining` 字段来防「stop future 被丢弃时句柄析构 detach 任务」，现在被丢弃的 future 不会从表里移除任何东西，重入直接重新处理同一个 cell（完成信号电平触发，已结束的立即返回）。
 - **完成信号必须有写者，而且要覆盖整个任务**：`catch_unwind` 只兜住任务体；结局的**上报路径**（`emit_notify` 会跑用户 handler）与任务体同在一个任务里，它 panic 时 wrapper 会在写结局之前展开——没有兜底则完成信号永不触发，`stop()` 与 `TaskHandle::wait` 一起挂死，`stop_with_timeout` 还会把 panic 误报成 `TaskAborted`。因此另有 `FinishOnUnwind` 守卫按成因兜底：正在展开（真 panic）记 `Panicked`，宿主直接把 future 丢掉（runtime 关闭、未记录的 abort）记取消——后者若也记 panic，会让一次 `stop()` 凭空多出 `TaskFailed` 假失败。两种情况都必须触发完成信号，否则排空会等一个永远不来的信号。panic hook 照常输出。
-- 剪除（`spawn` 里的 `retain`）只回收「不需要排空上报」的结局，`needs_drain_report` 是唯一出处：`Panicked`（无事件出口）与 `AbortedByTimeout`（只有排空上报）必须留在表里。代价是**未被 `stop` 清理前，表里会累积 panic 过的 cell**（每个很小）；上游应当在监控里用 `TaskFailed` 事件而不是依赖 `stop` 报错来发现任务 panic。
+- 剪除（`spawn` 里阈值触发的 `retain`）只回收「不需要排空上报」的结局，`needs_drain_report` 是唯一出处：`Panicked`（无事件出口）与 `AbortedByTimeout`（只有排空上报）必须留在表里。代价是**未被 `stop` 清理前，表里会累积 panic 过的 cell**（每个很小）；上游应当在监控里用 `TaskFailed` 事件而不是依赖 `stop` 报错来发现任务 panic。
 - `Context::task_count()` 统计尚未落定结局的任务，含 `stop` 正在排空的那一个。
 - `stop` 顺序：CAS 转入 `Stopping` 并广播取消 → 插件逆序 `stop` → 排空任务（`stop_with_timeout` 预算内等待，超时 `abort` 并上报 `ErrorKind::TaskAborted`）→ dispose hooks。
 - **取消来源写进结局本身**：`TaskOutcome` 区分 `AbortedByOwner` 与 `AbortedByTimeout`。owner 通过 `TaskHandle::abort()` 的取消不计入停止错误（否则「我让你停」会被报成失败），只有排空预算耗尽的取消才上报 `TaskAborted`。两者用同一个 `Mutex<Option<TaskOutcome>>` 的「先写者胜」落定，因此排空只读一次结局就能正确归类——分成「结局 + 旁边一个来源原子」会留下「结局已是取消、来源标记还没写入」的窗口，把 owner 取消误报成超时。取消方负责补发完成信号：被 abort 的任务不会再执行收尾代码。owner `abort` 与排空超时**真正同刻**并发时按「先写者胜」归类——先落定的一方定义这次取消的性质，这是可接受的平局语义，但值得知道它存在。
@@ -157,6 +157,7 @@ let child: Builder = ctx.scope()?;
 - `Builder` 阶段可 `provide` / `provide_factory` / `provide_collect` / `provide_dynamic` / `require_mut`。
 - `Context` 阶段只读：`require` / `try_require` / `require_all` / `require_all_recursive` / `require_dynamic` / `contains`；观测与生命周期句柄为 `is_stopping` / `cancelled` / `children` / `parent` / `id`，任务侧为 `spawn`（返回 `TaskHandle`）/ `task_count`。
 - `contains` 做完整存在性检查：普通服务 / 工厂 / 集合，任一层级存在即为真。`Dependency` 校验走另一套单例语义（`contains_type`），集合服务不满足单例依赖。
+- 命名空间划分是刻意的：`contains::<T>()` 对单例、工厂、集合任一种存在即为真（存在性可见性），但 `provide::<T>()` 的重复检查与 `Dependency` 校验只针对单例与工厂，因此集合既不满足单例依赖、也不遮蔽同类型单例；`remove::<T>()` 只移除普通服务，工厂与集合有各自通道。
 - `require_all` 只查本层，不沿父链冒泡；`require_all_recursive` 会依次汇总本层和所有父层集合。
 - `provide_dynamic` 注册的是 `Arc<DynamicValue<T>>`，运行期可通过 `require_dynamic` 获得共享句柄并修改内部值。
 - 懒工厂以 `Mutex` 串行化初始化：成功路径工厂至多执行一次，所有并发访问者拿到同一首个实例；失败不缓存，保留可重试语义。初始化锁跨工厂调用持有，工厂应为非阻塞纯计算。
@@ -193,6 +194,7 @@ pub trait Plugin: Send + Sync + 'static {
 - 插件间依赖：`PluginDependency::of("plugin-name")`。
 - 可选依赖只放宽“必须存在”，不改变“存在时必须按顺序启动”的语义。
 - `plugin_dependencies` 是唯一启动顺序契约。
+- 跨作用域的 `PluginDependency` 只保证「父层注册过该名字」，**不建立父子作用域的启动顺序**：父 `Runtime` 可以只 `build` 未 `start`，子作用域仍能独立 `start`（`src/lib.rs` 的 scope 测试编码了这一契约）。需要严格顺序时在应用层显式同步。
 - `priority` 参与 `start()` 与 `start_serial()` 共用的拓扑选点（影响同层内次序与逆序停止次序）；但分层并行 `start()` 的层划分只由依赖边决定，同层内不保证 priority/注册序总序。
 
 ### 5.3 启动分层并行
@@ -205,9 +207,11 @@ pub trait Plugin: Send + Sync + 'static {
 
 单个 `plugin()` 是事务性的：
 
-- `apply` 失败时回滚本次新增的服务、插件、hooks、事件订阅；
-- 集合服务按注册表快照记录的各类型长度精确截断，失败插件追加的集合元素不会泄漏；
-- 嵌套插件注册失败会保留内层插件名，同时外层副作用一并回滚；
+- `apply` 失败（返回 `Err` **或 panic 展开**）时回滚本次新增的服务、插件、hooks、事件订阅；
+- 回滚用**增量撤销日志**（undo log）逆序 replay 到本次 `plugin()` 的检查点，代价与本次改动量成正比，而非与注册表总规模成正比；
+- 集合服务按「弹出该类型最后压入的元素」精确撤销，失败插件追加的集合元素不会泄漏，也不会误删其他插件压入的元素；
+- 嵌套插件注册失败会保留内层插件名，同时外层副作用一并回滚（各层各持检查点，逆操作幂等）；
+- panic 路径用 `catch_unwind` + `resume_unwind`：先回滚再原样向上传播 panic，不把崩溃降级成 `Err`；
 - `plugin_with_config` 会连同配置服务一起回滚。
 
 ---
@@ -264,7 +268,6 @@ pub enum ErrorKind {
         ids: Vec<usize>,
     },
     Stopping,
-    TooManyScopes,
     SubscriptionNotFound,
     NoTaskRuntime,
     TaskFailed { task_id: u64 },
