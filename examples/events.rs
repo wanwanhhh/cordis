@@ -43,7 +43,7 @@ fn main() -> Result<(), Error> {
             .await?;
         println!("[1] 冒泡顺序: {:?}", observed.lock().unwrap());
         drop(session_rt);
-        rt.stop().await?;
+        rt.stop().await.into_result()?;
 
         // 2. off 取消订阅后 handler 不再收到事件
         let mut builder = Builder::new();
@@ -82,7 +82,7 @@ fn main() -> Result<(), Error> {
         assert!(trace.lock().unwrap().is_empty());
         println!("[3] Bail 阻止了向父链冒泡");
         drop(gated_rt);
-        rt.stop().await?;
+        rt.stop().await.into_result()?;
 
         // 4. 严格 emit 首个错误即中止；emit_notify 收集错误且不阻断父链冒泡
         let mut builder = Builder::new();
@@ -116,7 +116,7 @@ fn main() -> Result<(), Error> {
             notified.lock().unwrap()
         );
         drop(faulty_rt);
-        rt.stop().await?;
+        rt.stop().await.into_result()?;
 
         // 5. emit_parallel：同层 handler 并发执行，全部完成后再冒泡父链
         let mut builder = Builder::new();
@@ -148,7 +148,7 @@ fn main() -> Result<(), Error> {
         assert_eq!(*done.lock().unwrap(), 3);
         println!("[5] emit_parallel 同层 2 个 + 父链 1 个 handler 全部执行");
         drop(worker_rt);
-        rt.stop().await?;
+        rt.stop().await.into_result()?;
 
         Ok(())
     })

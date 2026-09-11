@@ -3,6 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::id::{Blockers, TaskId};
 use crate::plugin::PluginScope;
 
 /// 错误发生阶段。
@@ -18,13 +19,22 @@ pub enum Phase {
     Require,
     Start,
     Ready,
+    /// 本层刚提交关闭（进入 `Closing`）时同步执行的关闭回调。
+    ///
+    /// 与 `Stop` 分开：关闭回调早于插件 `stop`、任务排空与 dispose，是「开始收尾」
+    /// 阶段的错误，不该和清理失败混在一个阶段里。
+    Close,
     Stop,
     Dispose,
     Event,
 }
 
 /// 结构化错误种类。
+///
+/// `#[non_exhaustive]`：这是框架错误分类表，后续版本可能继续增补。下游 `match`
+/// 请保留兜底分支——它让新增变体不再是破坏性变更。
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// 服务已被注册过。
     ServiceAlreadyRegistered(String),
@@ -42,8 +52,11 @@ pub enum ErrorKind {
         expected: PluginScope,
         actual: PluginScope,
     },
-    /// 父 Runtime 停止时仍有活跃子 Runtime / Builder（含活跃子作用域 id 清单）。
-    ActiveScopes { count: u64, ids: Vec<usize> },
+    /// `StopOutcome::Blocked` 被折叠成 `Error` 时使用；表达「停止被活跃子作用域
+    /// 挡住，前置条件未满足、可重试」，不是清理失败。
+    ///
+    /// 清单由 `ScopeCore` 在同一临界区内与租约计数一起取出，因此与实际阻塞集合一致。
+    StopBlocked(Blockers),
     /// 父已进入停止，拒绝新 scope / spawn。
     Stopping,
     /// 事件订阅不存在或不属于当前 Context。
@@ -54,9 +67,23 @@ pub enum ErrorKind {
     ///
     /// 两条上报路径：`Runtime::stop` 排空时计入停止错误；`TaskHandle::wait` 直接
     /// 作为返回值。
-    TaskFailed { task_id: u64 },
+    TaskFailed { task_id: TaskId },
     /// 优雅停止超时，后台任务被强制取消。
-    TaskAborted { task_id: u64 },
+    TaskAborted { task_id: TaskId },
+    /// 生命周期用户代码 panic。
+    ///
+    /// 覆盖三类站点，由 `phase` 区分（`Close` / `Stop` / `Dispose`）：关闭回调、
+    /// 插件 `stop`、dispose hook。它们在 owner `stop()` 的清理路径上同步或被
+    /// `catch_unwind` 隔离执行，panic 绝不能逃出——逃出会让本层停在不可逆的
+    /// `Closing`/`Stopping` 却永远没有清理 future（`stop_future` 会被 poison）。
+    LifecyclePanicked { message: Option<String> },
+    /// 关闭回调链式注册超过收敛上界：某个回调在每次被调用时又注册新的回调。
+    ///
+    /// 三条上界共用这一个出口（每层至多记一条）：派发轮次、执行的嵌套深度、以及
+    /// **链式注册**（关闭钩子执行中触发、或目标层已开始派发后注册）的总数。触顶时
+    /// 停止收敛、把这一条计入停止错误，而不是静默丢弃或失控——同步递归无界会栈溢出
+    /// abort，分支式自增殖会按分支因子指数膨胀。
+    CloseHookDispatchOverflow,
     /// `start` 未能成功完成：重入一个已失败的运行时，或上一次启动被中断。
     ///
     /// 有根因时，聚合错误挂在 `source` 链上，可按
@@ -183,8 +210,13 @@ impl fmt::Display for Error {
                     self.phase
                 )
             }
-            ErrorKind::ActiveScopes { count, ids } => {
-                write!(f, "{:?}: active scopes: {count}, ids: {ids:?}", self.phase)
+            ErrorKind::StopBlocked(blockers) => {
+                write!(
+                    f,
+                    "{:?}: stop blocked by {}",
+                    self.phase,
+                    blockers.describe()
+                )
             }
             ErrorKind::Stopping => write!(f, "{:?}: stopping", self.phase),
             ErrorKind::SubscriptionNotFound => {
@@ -194,12 +226,27 @@ impl fmt::Display for Error {
                 write!(f, "{:?}: no tokio runtime context for spawn", self.phase)
             }
             ErrorKind::TaskFailed { task_id } => {
-                write!(f, "{:?}: background task {task_id} panicked", self.phase)
+                write!(f, "{:?}: background {task_id} panicked", self.phase)
             }
             ErrorKind::TaskAborted { task_id } => {
                 write!(
                     f,
-                    "{:?}: background task {task_id} aborted after drain timeout",
+                    "{:?}: background {task_id} aborted after drain timeout",
+                    self.phase
+                )
+            }
+            ErrorKind::LifecyclePanicked { message } => match message {
+                Some(message) => write!(
+                    f,
+                    "{:?}: lifecycle callback panicked: {message}",
+                    self.phase
+                ),
+                None => write!(f, "{:?}: lifecycle callback panicked", self.phase),
+            },
+            ErrorKind::CloseHookDispatchOverflow => {
+                write!(
+                    f,
+                    "{:?}: close hook dispatch round limit exceeded",
                     self.phase
                 )
             }

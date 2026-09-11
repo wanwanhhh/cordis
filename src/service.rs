@@ -4,7 +4,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{Error, ErrorKind, Phase};
 
@@ -196,45 +196,49 @@ impl<T> DynamicValue<T> {
         }
     }
 
-    /// 读取当前配置值。
+    /// 读锁获取：**中毒策略的唯一出口**。
     ///
-    /// 中毒策略与框架其余部分一致：持锁线程 panic 导致的 `RwLock` 中毒被容忍，
-    /// 返回中毒时刻的数据快照，不会把单次用户 panic 放大为读路径崩溃。
-    pub fn read(&self) -> impl Deref<Target = T> + '_ {
+    /// 持锁线程 panic 导致的 `RwLock` 中毒被容忍，返回中毒时刻的数据快照，不会把
+    /// 单次用户 panic 放大为读路径崩溃。四个公开方法都走这里，策略只此一份。
+    fn read_guard(&self) -> RwLockReadGuard<'_, T> {
         self.value
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 获取当前配置值的可变写锁。
-    ///
-    /// 中毒被容忍，见 [`DynamicValue::read`]。
-    pub fn write(&self) -> impl DerefMut<Target = T> + '_ {
+    /// 写锁获取；中毒容忍同 `read_guard`。
+    fn write_guard(&self) -> RwLockWriteGuard<'_, T> {
         self.value
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// 读取当前配置值。
+    ///
+    /// 中毒策略见 `read_guard`。
+    pub fn read(&self) -> impl Deref<Target = T> + '_ {
+        self.read_guard()
+    }
+
+    /// 获取当前配置值的可变写锁。
+    ///
+    /// 中毒被容忍，见 `read_guard`。
+    pub fn write(&self) -> impl DerefMut<Target = T> + '_ {
+        self.write_guard()
+    }
+
     /// 整体替换配置值。
     ///
-    /// 中毒被容忍，见 [`DynamicValue::read`]。
+    /// 中毒被容忍，见 `read_guard`。
     pub fn set(&self, value: T) {
-        let mut guard = self
-            .value
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = value;
+        *self.write_guard() = value;
     }
 
     /// 通过闭包更新配置值。
     ///
-    /// 中毒被容忍，见 [`DynamicValue::read`]。
+    /// 中毒被容忍，见 `read_guard`。
     pub fn update(&self, f: impl FnOnce(&mut T)) {
-        let mut guard = self
-            .value
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        f(&mut guard);
+        f(&mut self.write_guard());
     }
 }
 
@@ -255,11 +259,8 @@ impl ServiceRegistry {
     /// 注册一个普通服务。
     pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<(), Error> {
         let key = TypeId::of::<T>();
-        if self.services.contains_key(&key) || self.factories.contains_key(&key) {
-            return Err(Error::new(
-                Phase::Build,
-                ErrorKind::ServiceAlreadyRegistered(std::any::type_name::<T>().to_string()),
-            ));
+        if self.contains_type(key) {
+            return Err(Self::duplicate_slot_error::<T>());
         }
         self.services.insert(key, Box::new(value));
         Ok(())
@@ -271,11 +272,8 @@ impl ServiceRegistry {
         factory: impl Fn() -> Result<T, Error> + Send + Sync + 'static,
     ) -> Result<(), Error> {
         let key = TypeId::of::<T>();
-        if self.services.contains_key(&key) || self.factories.contains_key(&key) {
-            return Err(Error::new(
-                Phase::Build,
-                ErrorKind::ServiceAlreadyRegistered(std::any::type_name::<T>().to_string()),
-            ));
+        if self.contains_type(key) {
+            return Err(Self::duplicate_slot_error::<T>());
         }
         self.factories.insert(
             key,
@@ -286,6 +284,14 @@ impl ServiceRegistry {
             }),
         );
         Ok(())
+    }
+
+    /// 普通服务与工厂共用同一个类型槽位；「已被占用」的判定与文案只此一处。
+    fn duplicate_slot_error<T: Send + Sync + 'static>() -> Error {
+        Error::new(
+            Phase::Build,
+            ErrorKind::ServiceAlreadyRegistered(std::any::type_name::<T>().to_string()),
+        )
     }
 
     /// 注册一个集合服务实现。

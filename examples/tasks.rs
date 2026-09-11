@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cordis::{
-    Builder, Context, Error, ErrorKind, EventControl, FnEventHandler, Phase, Plugin, TaskFailed,
+    AbortReason, Builder, Context, Error, ErrorKind, EventControl, FnEventHandler, Phase, Plugin,
+    TaskFailed, TaskOutcome,
 };
 
 /// 优雅 worker：等取消信号，而不是轮询 `is_stopping`。
@@ -61,7 +62,7 @@ async fn main() -> Result<(), Error> {
     // owner 侧等信号后收口。请求不等于 Stopping：此刻 spawn / scope 仍然可用。
     assert!(!ctx.is_stopping());
     rt.handle().cancelled().await;
-    rt.stop().await?;
+    rt.stop().await.into_result()?;
     requester.await.unwrap();
     println!("root 已停止（worker 由取消信号唤醒后自然退出）");
 
@@ -81,9 +82,13 @@ async fn main() -> Result<(), Error> {
         Ok::<(), Error>(())
     })?;
 
-    // owner 主动取消并等它落定：这是请求，不是失败，不计入停止错误。
+    // owner 主动取消并等它落定：结局是 Aborted(Owner)，不是「跑完了」，
+    // 但也不计入停止错误（取消是请求，不是失败）。
     run_task.abort();
-    run_task.wait().await?;
+    assert!(matches!(
+        run_task.wait().await,
+        TaskOutcome::Aborted(AbortReason::Owner)
+    ));
     assert!(run_task.is_finished());
 
     // 4. 与「主动取消」对照：排空预算耗尽触发的取消会作为停止错误上报。
@@ -94,11 +99,12 @@ async fn main() -> Result<(), Error> {
     match session_rt
         .stop_with_timeout(Duration::from_millis(50))
         .await
+        .into_result()
     {
         Ok(()) => println!("session {session_id} 干净停止"),
         Err(err) => println!("session {session_id} 停止报告: {err}"),
     }
     drop(session_rt);
-    rt.stop().await?;
+    rt.stop().await.into_result()?;
     Ok(())
 }

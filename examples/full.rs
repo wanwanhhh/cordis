@@ -61,7 +61,7 @@ fn main() -> Result<(), Error> {
 
         let mut rt = builder.build()?;
         rt.start().await?;
-        rt.stop().await?;
+        rt.stop().await.into_result()?;
 
         Ok(())
     })

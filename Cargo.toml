@@ -6,7 +6,13 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
-tokio = { version = "1", default-features = false, features = ["rt", "time"], optional = true }
+# 库自己必须声明它用到的全部 feature，不能依赖下游或 dev-dependencies 的特性统一
+# 把它带进来（否则 `cargo build --all-features` 单编库就失败，下游仅启用本 crate 的
+# tokio feature 也会失败）：
+# - `macros`：`tokio::select!`；
+# - `sync`：`tokio::sync::{mpsc, watch}`（通知 lane）；
+# - `rt`/`time`：任务注册表与带预算的停止。
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros"], optional = true }
 
 [features]
 default = ["tokio"]

@@ -112,6 +112,6 @@ fn main() -> Result<(), Error> {
             calls.0.load(Ordering::SeqCst)
         );
 
-        rt.stop().await
+        rt.stop().await.into_result()
     })
 }

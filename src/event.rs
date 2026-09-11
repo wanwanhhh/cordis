@@ -3,9 +3,11 @@
 use std::any::{Any, TypeId};
 use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 
+use crate::id::ScopeId;
 use crate::{Context, Error, ErrorKind, Phase};
 
 /// 事件 marker。
@@ -61,15 +63,19 @@ where
 }
 
 /// 类型擦除的异步事件 handler。
-#[async_trait]
+///
+/// `call` 手写为返回 boxed future，而不是 `#[async_trait]`：内层
+/// [`EventHandler::handle`] 本身已返回 boxed future，手写签名可以直接透传它，
+/// 省掉 async_trait 在外层再包的那一层 box（每个 handler 每次调用少一次堆分配；
+/// 实测由 2 次/88 B 降到 1 次/32 B）。
 pub trait ErasedEventHandler: Send + Sync + 'static {
     fn id(&self) -> usize;
     fn event_type_id(&self) -> TypeId;
-    async fn call(
-        &self,
-        event: &(dyn Any + Send + Sync),
-        ctx: &Context,
-    ) -> Result<EventControl, Error>;
+    fn call<'a>(
+        &'a self,
+        event: &'a (dyn Any + Send + Sync),
+        ctx: &'a Context,
+    ) -> Pin<Box<dyn Future<Output = Result<EventControl, Error>> + Send + 'a>>;
 }
 
 /// 具体类型的事件 handler 包装。
@@ -89,7 +95,6 @@ impl<E, H> TypedEventHandler<E, H> {
     }
 }
 
-#[async_trait]
 impl<E, H> ErasedEventHandler for TypedEventHandler<E, H>
 where
     E: Event,
@@ -103,23 +108,23 @@ where
         TypeId::of::<E>()
     }
 
-    async fn call(
-        &self,
-        event: &(dyn Any + Send + Sync),
-        ctx: &Context,
-    ) -> Result<EventControl, Error> {
+    fn call<'a>(
+        &'a self,
+        event: &'a (dyn Any + Send + Sync),
+        ctx: &'a Context,
+    ) -> Pin<Box<dyn Future<Output = Result<EventControl, Error>> + Send + 'a>> {
         // 派发路径（含冻结后的按 TypeId 分组）已保证类型匹配；该分支实际
         // 不可达。即使触达也以错误上报，绝不 panic 击穿用户的 await 点。
-        let event = event
-            .downcast_ref::<E>()
-            .ok_or_else(|| Error::new(Phase::Event, ErrorKind::Other))?;
-        self.handler.handle(event, ctx).await
+        match event.downcast_ref::<E>() {
+            Some(event) => self.handler.handle(event, ctx),
+            None => Box::pin(async { Err(Error::new(Phase::Event, ErrorKind::Other)) }),
+        }
     }
 }
 
 /// 事件订阅句柄。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Subscription {
-    pub(crate) context_id: usize,
+    pub(crate) context_id: ScopeId,
     pub(crate) handler_id: usize,
 }

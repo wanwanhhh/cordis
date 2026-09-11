@@ -184,11 +184,11 @@ fn main() -> Result<(), Error> {
         assert!(child.has_plugin("root-only"));
         let mut child_rt = child.build()?;
         child_rt.start_serial().await?;
-        child_rt.stop().await?;
+        child_rt.stop().await.into_result()?;
         drop(child_rt);
         println!("[6] child-only 插件在子作用域运行完毕");
 
-        rt.stop().await?;
+        rt.stop().await.into_result()?;
 
         // 7. 父 Runtime 停止后 scope() 被拒
         let err = match ctx.scope() {

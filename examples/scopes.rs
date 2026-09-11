@@ -82,13 +82,13 @@ fn main() -> Result<(), Error> {
 
         let mut subflow_rt = subflow.build()?;
         subflow_rt.start().await?;
-        subflow_rt.stop().await?;
+        subflow_rt.stop().await.into_result()?;
         drop(subflow_rt);
 
-        session_rt.stop().await?;
+        session_rt.stop().await.into_result()?;
         drop(session_rt);
 
-        rt.stop().await?;
+        rt.stop().await.into_result()?;
 
         Ok(())
     })

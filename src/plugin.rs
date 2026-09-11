@@ -123,11 +123,24 @@ pub trait Plugin: Send + Sync + 'static {
     }
 
     /// 启动阶段。
+    ///
+    /// 返回 `Err` 后，框架仍会为该插件调用一次 [`Plugin::stop`]：部分初始化的
+    /// 资源需要在 `stop` 里回收。启动分层并行时，同一层内尚未轮到 `start` 的插件
+    /// 也会被登记为待回收，因此 `stop` 可能在 `start` 从未成功、甚至从未被调用时
+    /// 到达。
     async fn start(&self, _ctx: &Context) -> Result<(), Error> {
         Ok(())
     }
 
     /// 销毁阶段。
+    ///
+    /// 清理由 `Runtime` 自持的 future 驱动，每个被回收项的 `stop` **恰好被 poll 到
+    /// 完成一次**：`Runtime::stop` 的 future 即使被调用方中途丢弃，重入也只会继续
+    /// poll 同一个清理 future，不会从该项开头重放。因此实现**不需要**为「重复调用」
+    /// 做幂等。
+    ///
+    /// 但有一条契约必须满足：`stop` 可能在 `start` 未成功、甚至从未被调用时到达
+    /// （见 [`Plugin::start`] 的说明），实现不能假设 `start` 里的初始化已经全部完成。
     async fn stop(&self, _ctx: &Context) -> Result<(), Error> {
         Ok(())
     }
