@@ -98,7 +98,7 @@ src/
 - 排空期间**不得持任务表锁**：`while let Some(t) = lock().pop()` 的临时值会活到循环体结束，必须写成 `loop { let Some(..) = ... else { break } }`。
 - `stop_with_timeout` 的预算为全部任务的总预算；超时任务 abort 后记 `TaskAborted`，不阻塞后续任务与 dispose。预算在**进入清理时**一次算定并随自持 future 存续，重入**不重置**——那才是真正的总上界。
 - **插件名唯一性必须在 `apply` 之前占住**（`Data.declared_names`）：`apply` 是同步可重入窗口，内部可经 `Configurator::plugin` 再注册。若查重依赖 `plugin_index`（`apply` 成功后才写入），同名嵌套注册会看到陈旧表而被接受，导致同名插件装两份、依赖解析歧义。预声明必须进 undo 日志，失败/回滚时撤销。
-- **注册表停机闩与登记表同锁**：`shutting_down` 与 `entries` 分属两个同步域会在「认领后、发布前」裂开窗口，让停表后仍发布出 `Running`。`open` 的认领与发布复查、`close_all` 的置位与快照都必须在同一临界区。**取出 `Runtime` 的 `stop().await` 一律由 `ClosingGuard` 持有**（`close` 与 `open` 两处回收路径共用）：非终态结局（`Blocked`）或 await 点被取消时必须把 owner 放回、名字不释放（`restore` 用 `insert`，因为 `open` 发布被拒后条目已被摘掉），可 `close` 续跑；只有终态才 `discard` 摘名并析构。缺少它会命中 debug Drop 护栏或静默跳过插件 `stop`，并留下永久 `Busy` 的空槽（`close_cancellation_keeps_scope_recoverable` / `failed_start_cancellation_keeps_owner_recoverable` 守着）。
+- **注册表停机闩与登记表同锁**：`shutting_down` 与 `entries` 分属两个同步域会在「认领后、发布前」裂开窗口，让停表后仍发布出 `Running`。`open` 的认领与发布复查、`close_all` 的置位与快照都必须在同一临界区。**取出 `Runtime` 的 `stop().await` 一律由 `ClosingGuard` 持有**（`close` 与 `open` 两处回收路径共用）：非终态结局（`Blocked`）或 await 点被取消时必须把 owner 放回、名字不释放（`restore` 用 `insert`，覆盖名字上的在飞槽位），可 `close` 续跑；只有终态才 `discard` 摘名并析构。缺少它会命中 debug Drop 护栏或静默跳过插件 `stop`，并留下永久 `Busy` 的空槽（`close_cancellation_keeps_scope_recoverable` / `failed_start_cancellation_keeps_owner_recoverable` 守着）。
 - 注册表**不得**保留不可达的错误变体：所有锁都 `into_inner` 解毒，没有 `RegistryError::Poisoned` 的构造点。
 
 ---

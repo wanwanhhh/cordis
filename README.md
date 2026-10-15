@@ -103,6 +103,7 @@ fn main() -> Result<(), Error> {
 - **`Drop` 不排空 spawn 任务**：忘记 `stop()` 直接 drop `Runtime` 时，`Context::spawn` 的未完成任务随句柄丢弃而脱离框架管理（`Drop` 不做异步清理）。请经 `stop()` / `stop_with_timeout()` 收口。
 - **任务取消尽力而为**：`stop_with_timeout` 超时后对未完成任务执行 tokio 协作式取消；卡在同步阻塞调用中的任务无法被强制杀死。被动取消只中断任务在 await 点的执行，任务体里同步阻塞的代码仍会跑完。
 - **`stop_with_timeout` 需要 tokio time driver（存在待排空任务时）**：超时排空用 `tokio::time` 计时，要求当前 runtime 启用了 time driver（标准 `new_multi_thread`，或显式 `enable_time` 的 `new_current_thread`）。另外预算大到 `Instant` 无法表示时（如 `Duration::MAX`）按「不设超时」处理，不会 panic——需要真正的上界就别传天文数字。
+- **强杀会连在飞的跨作用域创建一起砍**：`stop_with_timeout` 预算到点强杀本层任务时，任务里正在 `await` 的 `ScopeRegistry::open` 一并被砍，半成品只剩 `Drop`（插件 `stop`/dispose 不跑）。别让「创建子作用域」只活在会被强杀的任务里：让 `open` 跑完，或把它的 future 交给不会被强杀的所有者持有到落定。
 - **`TaskHandle` 丢弃不等于取消**：`TaskHandle` 不是 guard，drop 它任务照常运行；取消必须显式 `abort()`，或由 `Runtime::stop` 的排空收口。
 
 ## 破坏性变更记录
@@ -128,8 +129,9 @@ fn main() -> Result<(), Error> {
 - `CloseReport::attempts`：**删除**。`close` 单次调用只跑一轮 `stop`（恒为 1），「被阻塞则重试」是调用方的决定，该字段不表达任何信息。
 - `RegistryError::Poisoned`：**删除**。所有锁都 `into_inner` 解毒，该变体没有构造点、不可达。
 - `Context::on_closing` / 关闭回调的链式注册现在有**三道上界**并记一条 `CloseHookDispatchOverflow`（每层至多一条）：派发轮次 `MAX_CLOSING_HOOK_ROUNDS`（16）、执行的**嵌套深度**（16）、**链式注册**的总数 `MAX_CHAINED_CLOSING_HOOKS`（4096，按层计）。「链式」指注册发生在关闭钩子执行中、或层已开始派发之后；装配期声明与**层存活期间普通代码**的动态注册都不计（含反复注册+注销）。触顶的回调不再登记、也不执行（轮次触顶例外：收尾补跑剩余项）。此前该路径是同步无界递归：「每次注册自身」的回调会栈溢出 abort，一次注册多个副本的回调会按分支因子指数膨胀，关闭钩子向尚未开始派发的另一层注册还能绕过预算并跨层放大。
-- `ScopeRegistry::open` 的启动失败回收若被活跃孙级 `Blocked`：owner 以 `Closing(Some)` 保留、**名字不释放**，同名 `open` 得到 `AlreadyExists`，须先回收孙级再 `close` 续跑（此前「名字必释放」的表述不成立）。
-- `ScopeRegistry::open` / `close` 在回收 `stop` 的 await 点被取消时不再析构 `Runtime`（由 `ClosingGuard` 放回 `Closing(Some)`，可重试）；`open` 的 `start().await` 仍是明文契约上的未兜底窗口（owner 应让 `open` 跑完）。
+- `ScopeRegistry::open` 的启动失败回收若被活跃孙级 `Blocked`：owner 以 `Blocked` 槽位保留、**名字不释放**，同名 `open` 得到 `AlreadyExists`，须先回收孙级再 `close` 续跑（此前「名字必释放」的表述不成立）。
+- `ScopeRegistry::open` / `close` 在回收 `stop` 的 await 点被取消时不再析构 `Runtime`（由 `ClosingGuard` 放回 `Blocked` 槽位，可重试）；`open` 的 `start().await` 仍是明文契约上的未兜底窗口（owner 应让 `open` 跑完）。
+- `ScopeRegistry::close_all` 现在**先等每个名字上的在飞工作落定**（在飞的 `open` / 并发的 `close`）再收口：`is_clean()` 为真时，父级立刻 `stop()` 不再因在飞 `open` 瞬时 `Blocked`，调用方不需要「先确认没有在飞创建」或对父级 `stop` 重试；在飞工作没在预算内落定则如实记 `RegistryError::Busy` 进 `failed`。
 
 自本版起生效；0.x 阶段该类型不做向后兼容承诺。
 

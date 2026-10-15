@@ -25,20 +25,33 @@
 //! 借出去的占位由 [`Reservation`] 的 `Drop` 兜底：`open` 的 future 若在
 //! `build`/`start` 中途被丢弃，占位会被摘掉，不会永久泄漏那个名字。
 //!
+//! ## 在飞的工作：可见、可等
+//!
+//! `Reserved` / `Closing` 两种槽位都是一个名字上的「在飞工作」（正在构建/启动的
+//! `open`、正在 `stop` 的 `close`），它们各带一个**落定信号**：等在飞工作落定的人
+//! （[`ScopeRegistry::close_all`]）据此知道这一轮什么时候结束。于是「子作用域收口后
+//! 父级立刻能停」不再取决于调用方是否恰好没在创建子级。
+//!
 //! ## 已知边界：`open` 中途被丢弃
 //!
 //! 占位能收回；回收路径上的 `stop().await` 也由 [`ClosingGuard`] 兜底——future 在此
-//! 被丢弃时 owner 以 `Closing(Some)` 留在表里，可 `close` 续跑。唯一没有兜底的是
+//! 被丢弃时 owner 以 [`Slot::Blocked`] 留在表里，可 `close` 续跑。唯一没有兜底的是
 //! `runtime.start().await`：`open` 的 future 在此期间被丢弃时，那个已进入启动流程的
 //! `Runtime` 会随栈展开被 drop。框架的 `Runtime::drop` 在 debug 构建下把「进过启动
 //! 流程却没到 `Stopped`」视为泄漏并硬失败（release 下静默）。这是 `Runtime` 的既有
-//! 契约（owner 应当 `stop`），不是注册表引入的：要让创建具备取消安全性，请让 `open`
-//! 跑完，或用外层超时把「创建」当成一个整体而不是丢弃它。
+//! 契约（owner 应当 `stop`），不是注册表引入的。
+//!
+//! 谁会造出这种丢弃：**框架自己**。`stop_with_timeout` 的预算到点会强杀本层任务
+//! （记 `TaskAborted`），任务连同它正在等的 `await` 一起被砍——若那正是某个 `open`，
+//! 半成品作用域就只剩下 drop 这一条路（插件 `stop`/dispose 不跑）。所以调用方的
+//! 契约是：**别让「创建子作用域」只活在会被强杀的任务里**——要么让 `open` 跑完，
+//! 要么把创建交给不会被强杀的所有者，由它持有 future 到落定。
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use crate::waiters::Waiters;
 use crate::{Builder, Context, Error, ErrorKind, Runtime, StopOutcome};
 
 /// 管理一批命名子作用域的 owner。
@@ -64,19 +77,24 @@ struct RegistryState {
 }
 
 enum Slot {
-    /// 名字已认领，`Runtime` 尚未构建完成。
-    Reserved,
+    /// 名字已认领，`Runtime` 尚未构建完成（正在构建/启动，或在回滚半成品）。
+    ///
+    /// 带落定信号：等在飞工作的人据此知道这一轮什么时候结束（见模块头「在飞的工作」）。
+    Reserved(Arc<InFlight>),
     /// 已启动的成品；owner 独占持有。
     ///
     /// 装箱：`Runtime` 比 `Reserved` 大得多，放进 `HashMap` 的槽位会让整个表按最大
     /// 变体撑开。作用域数量少且长驻，一次装箱换来表内元素变小是划算的。
     Running(Box<Runtime>),
-    /// 关闭进行中或上一轮被阻塞。名字**仍被占住**：`Running -> Closing` 是状态迁移，
-    /// 不是把名字让出去，因此并发 `open` 同名只会得到 `AlreadyExists`。
+    /// 关闭在飞：本轮的 `Runtime` 已被取出（由 `ClosingGuard` 持有并 `stop`），
+    /// 名字**仍被占住**、租约尚未归还。同样带落定信号。
     ///
-    /// - `None`：本轮的 `Runtime` 已被取出，正在 `stop`（有 close 在飞）；
-    /// - `Some`：上一轮 `stop` 返回 `Blocked`（子级还活着），owner 已放回，可重试。
-    Closing(Option<Box<Runtime>>),
+    /// `Running -> Closing` 是状态迁移，不是把名字让出去：并发 `open` 同名只会得到
+    /// `AlreadyExists`。
+    Closing(Arc<InFlight>),
+    /// 上一轮 `stop` 返回 `Blocked`（子级还活着）：owner 已放回，回收孙级后对同名
+    /// `close` 续跑即可。
+    Blocked(Box<Runtime>),
 }
 
 /// 注册表层面的失败。
@@ -191,7 +209,7 @@ pub struct CloseAllReport {
     /// 包含 `CloseStatus::Blocked` 的条目——它们**不计为失败**：owner 仍留在注册表
     /// 里，回收孙级后重试即可。
     pub closed: Vec<(String, CloseReport)>,
-    /// 连 `stop` 都没能执行的（例如遇到在飞的 `open`/`close` 而拿到 `Busy`）。
+    /// 连 `stop` 都没能执行的：在飞工作在预算内没落定（`Busy`），或 `stop` 都跑不成。
     pub failed: Vec<(String, RegistryError)>,
 }
 
@@ -199,6 +217,36 @@ impl CloseAllReport {
     /// 是否全部干净关闭。
     pub fn is_clean(&self) -> bool {
         self.failed.is_empty() && self.closed.iter().all(|(_, report)| report.is_clean())
+    }
+}
+
+/// 一个名字上「在飞工作」的落定信号（在飞的 `open`、在飞的 `close`）。
+///
+/// 电平触发、可被多人等：晚到的等待者立刻就绪，因此不存在「信号先发、等待者后到」
+/// 的丢唤醒窗口。
+struct InFlight {
+    settled: Waiters,
+}
+
+/// 落定信号的持有者：在飞工作无论走哪条路径结束（成功、失败、future 被丢弃）都
+/// 会发出——槽位里只放 [`Arc<InFlight>`]，持有者在这里，靠 Drop 而不是靠「记得发」。
+struct InFlightOwner(Arc<InFlight>);
+
+impl InFlightOwner {
+    fn new() -> Self {
+        Self(Arc::new(InFlight {
+            settled: Waiters::new(),
+        }))
+    }
+
+    fn signal(&self) -> Arc<InFlight> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Drop for InFlightOwner {
+    fn drop(&mut self) {
+        self.0.settled.fire_all();
     }
 }
 
@@ -229,10 +277,10 @@ impl Drop for Reservation<'_> {
 /// 调用方必须把 `Runtime` 移出登记表才能调用 `&mut self` 的 `stop`；这段「已移出、
 /// 尚未到终态」的所有权若不设防，future 在 `await` 点被取消时会随栈展开析构
 /// `Runtime`（debug 命中 Drop 护栏、release 静默跳过插件 `stop`），并在表里留下
-/// 无人可取的 `Closing(None)` —— 该名字此后永久 `Busy`、不可再关闭。这与 `open`
-/// 的 [`Reservation`] 是同一个问题的两种形态。
+/// 一个无人推进的「关闭在飞」条目 —— 该名字此后永久 `Busy`、不可再关闭。这与
+/// `open` 的 [`Reservation`] 是同一个问题的两种形态。
 ///
-/// 守卫在取消时把 `Runtime` 放回 `Closing(Some)`，使状态等价于 `Blocked`：owner 仍在
+/// 守卫在取消时把 `Runtime` 放回 [`Slot::Blocked`]，使状态等价于 `Blocked`：owner 仍在
 /// 注册表内、`stop` 的自持 future 也还在 `Runtime` 里，重试 `close` 即续跑。
 struct ClosingGuard<'a> {
     registry: &'a ScopeRegistry,
@@ -257,17 +305,16 @@ impl<'a> ClosingGuard<'a> {
             .expect("closing guard holds the runtime until finalized")
     }
 
-    /// 非终态收尾：把 owner 放回槽位，守卫不再兜底。
+    /// 非终态收尾：把 owner 放回槽位（[`Slot::Blocked`]），守卫不再兜底。
     ///
-    /// 用 `insert` 而不是「就地覆盖已存在槽位」：`open` 在发布被拒后已把条目摘掉，
-    /// 取消点还原时必须**重新占住名字**，否则 owner 无处安放会随守卫析构（正是本
-    /// 守卫要消除的）并把名字让给别人。
+    /// 用 `insert` 覆盖名字上的槽位（此刻是在飞的 `Reserved` / `Closing`）：落成
+    /// `Blocked` 后名字仍被占住，等后续 `close` 续跑。
     fn restore(&mut self) {
         if let Some(runtime) = self.runtime.take() {
-            self.registry.lock().entries.insert(
-                self.name.to_string(),
-                Slot::Closing(Some(Box::new(runtime))),
-            );
+            self.registry
+                .lock()
+                .entries
+                .insert(self.name.to_string(), Slot::Blocked(Box::new(runtime)));
         }
         self.armed = false;
     }
@@ -332,7 +379,7 @@ impl ScopeRegistry {
     /// 半成品会被回收（`stop` + drop），名字被释放，可重试。
     ///
     /// 例外：回收 `stop` 若被活跃孙作用域阻塞（`Blocked`，插件在 `start` 里泄漏了
-    /// 子作用域），owner 以 `Closing(Some)` 保留、**名字不释放**，再 `open` 同名会得
+    /// 子作用域），owner 以 [`Slot::Blocked`] 保留、**名字不释放**，再 `open` 同名会得
     /// [`RegistryError::AlreadyExists`]；调用方须先回收孙级，再对同一名字 `close` 续跑。
     pub async fn open<F>(
         &self,
@@ -344,6 +391,8 @@ impl ScopeRegistry {
     {
         let name = name.into();
         let parent = self.parent()?.clone();
+        // 在飞工作的落定信号：从认领活到本函数返回（含被取消），槽位里放它的副本。
+        let in_flight = InFlightOwner::new();
 
         // 第一步：锁内「查停机 + 认领名字」。占住才继续——输家到此为止，不产生
         // 任何作用域。停机闩与登记表同锁，因此这里与 `close_all` 的置位互为线性化点。
@@ -355,7 +404,9 @@ impl ScopeRegistry {
             if state.entries.contains_key(&name) {
                 return Err(RegistryError::AlreadyExists(name));
             }
-            state.entries.insert(name.clone(), Slot::Reserved);
+            state
+                .entries
+                .insert(name.clone(), Slot::Reserved(in_flight.signal()));
         }
         let mut reservation = Reservation {
             registry: self,
@@ -381,8 +432,8 @@ impl ScopeRegistry {
             // 的 debug 护栏会因「进过启动流程却没到 Stopped」硬失败。
             //
             // 名字的处置权交给守卫：`stop` 返回 `Blocked`（插件在 `start` 里创建并
-            // 泄漏了子作用域）时放回 `Closing(Some)`（调用方可 `close` 续跑），终态才
-            // 摘名；`stop` 的 await 点被取消时守卫的 Drop 同样放回，不析构 owner。
+            // 泄漏了子作用域）时放回 [`Slot::Blocked`]（调用方可 `close` 续跑），终态
+            // 才摘名；`stop` 的 await 点被取消时守卫的 Drop 同样放回，不析构 owner。
             // 因此必须先 `disarm` 占位守卫，否则它在 `open` 返回时会把条目又摘掉。
             reservation.disarm();
             let mut guard = ClosingGuard::new(self, &name, runtime);
@@ -399,20 +450,23 @@ impl ScopeRegistry {
 
         // 第三步：锁内复查停机后再发布。这是收口线性化点的另一半——若 `close_all`
         // 已在本次 `start().await` 期间置位，就**不能**把 `Running` 发布进一个已经
-        // 停机的注册表；就地摘掉占位并取回刚建好的 `Runtime`，**锁外**再回收。
+        // 停机的注册表；把占位就地改成「关闭在飞」（名字不离表，等在飞工作落定的人才
+        // 看得见这一轮回滚）并取回刚建好的 `Runtime`，**锁外**再回收。
         let rejected: Option<Runtime> = {
             let mut state = self.lock();
             if state.shutting_down {
-                state.entries.remove(&name);
+                state
+                    .entries
+                    .insert(name.clone(), Slot::Closing(in_flight.signal()));
                 Some(runtime)
             } else {
                 match state.entries.get_mut(&name) {
-                    Some(slot @ Slot::Reserved) => {
+                    Some(slot @ Slot::Reserved(_)) => {
                         *slot = Slot::Running(Box::new(runtime));
                         None
                     }
                     // 不可能：占位只有本流程会替换，且 `Reservation` 尚未 disarm。
-                    Some(Slot::Running(_) | Slot::Closing(_)) => {
+                    Some(Slot::Running(_) | Slot::Closing(_) | Slot::Blocked(_)) => {
                         debug_assert!(false, "reserved slot replaced before publish");
                         None
                     }
@@ -426,8 +480,7 @@ impl ScopeRegistry {
         reservation.disarm();
         if let Some(runtime) = rejected {
             // 回收刚建好的 `Runtime`；同样由守卫持有——`stop` 返回 `Blocked` 时保留为
-            // `Closing(Some)` 供调用方 `close` 续跑（此时条目已被摘掉，守卫会重新占
-            // 住名字），await 点被取消时也不析构 owner。
+            // [`Slot::Blocked`] 供调用方 `close` 续跑，await 点被取消时也不析构 owner。
             let mut guard = ClosingGuard::new(self, &name, runtime);
             let outcome = guard.runtime_mut().stop().await;
             if outcome.blockers().is_some() {
@@ -447,31 +500,35 @@ impl ScopeRegistry {
 
     /// 关闭并回收一个子作用域，返回三分结局。
     ///
-    /// 锁内把 `Running` 迁到 `Closing(None)`（名字全程被占住）并取出 owned
+    /// 锁内把条目迁到「关闭在飞」（名字全程被占住，并登记落定信号）→ 取出 owned
     /// `Runtime` → 释放锁 → `stop_with_timeout`（不在持锁期间 await）。
     ///
     /// 结局**非终态**时不得析构 owner：`Blocked` 表示子级还活着，`Runtime` 会被
-    /// 放回 `Closing(Some(..))` 供调用方回收孙级后重试——把它当终态 `drop` 会命中
+    /// 放回 [`Slot::Blocked`] 供调用方回收孙级后重试——把它当终态 `drop` 会命中
     /// `Runtime` 的 Drop 护栏（debug）或静默跳过插件 `stop`（release）。
+    ///
+    /// 名字上有在飞工作时返回 [`RegistryError::Busy`]：调用方要么等（[`close_all`]
+    /// 就是这么做的），要么回头再来。
     pub async fn close(&self, name: &str, budget: Duration) -> Result<CloseReport, RegistryError> {
+        let in_flight = InFlightOwner::new();
         let runtime = {
             let mut state = self.lock();
             match state.entries.get_mut(name) {
                 None => return Err(RegistryError::NotFound(name.to_string())),
-                Some(Slot::Reserved | Slot::Closing(None)) => {
+                Some(Slot::Reserved(_) | Slot::Closing(_)) => {
                     return Err(RegistryError::Busy(name.to_string()));
                 }
-                Some(slot) => match std::mem::replace(slot, Slot::Closing(None)) {
+                Some(slot) => match std::mem::replace(slot, Slot::Closing(in_flight.signal())) {
                     Slot::Running(runtime) => *runtime,
-                    Slot::Closing(Some(runtime)) => *runtime,
+                    Slot::Blocked(runtime) => *runtime,
                     // 上面两个 arm 已排除。
-                    Slot::Reserved | Slot::Closing(None) => unreachable!(),
+                    Slot::Reserved(_) | Slot::Closing(_) => unreachable!(),
                 },
             }
         };
 
         // 由守卫持有 owner：`close` 的 future 若在 `stop` 的 await 点被丢弃，守卫把
-        // `Runtime` 放回 `Closing(Some)`（等价 `Blocked`，可重试），而不是随栈展开
+        // `Runtime` 放回 [`Slot::Blocked`]（等价 `Blocked`，可重试），而不是随栈展开
         // 析构它并留下永久 `Busy` 的空槽。
         let mut guard = ClosingGuard::new(self, name, runtime);
         let outcome = guard.runtime_mut().stop_with_timeout(budget).await;
@@ -490,17 +547,16 @@ impl ScopeRegistry {
     /// **串行**关闭：子作用域是父层的租约，收口的正确顺序就是「子级全停 → 父级才停」。
     /// 本方法只负责把注册表管着的直接子级关光；它们各自的孙级由它们自己负责。
     ///
-    /// 返回后保证：注册表里**不存在 `Running` 条目**。被孙级阻塞的子级以
-    /// `Blocked` 报告并保留 owner（`Closing(Some)`），调用方须先回收那些孙级再重试
-    /// `close`；在飞 `open` 的占位（`Reserved`）会因发布时复查停机而自行清理，不会
-    /// 在返回后变成新的 `Running`。
+    /// 每个名字先等它上面的**在飞工作**落定（在飞的 `open`、别的调用方正在做的
+    /// `close`），再收口。这条等待是本方法的核心保证：在飞工作已经持有父级租约，
+    /// 只有它落定（在飞的 `open` 被发布复查挡下、回滚 `stop` 走完）租约才归还——
+    /// 所以「返回后立刻 `stop()` 父级不会 `Blocked`」不再要求调用方先确认「没有在
+    /// 飞的创建」。等待与关闭共用同一个 `budget`（逐个名字计），没等到就在 `failed`
+    /// 里如实记 `Busy`。
     ///
-    /// 但「返回后立刻 `stop` 父级不会 `Blocked`」只在**没有在飞 `open`** 时成立：
-    /// 一个已认领、尚未发布的 `open` 可能已经 `ctx.scope()` 出了子作用域，即已持有
-    /// 父级租约，而它要等到发布复查停机、走回滚 `stop` 才归还。若父级在这段窗口里
-    /// `stop`，会瞬时返回 `Blocked`（等那个 `open` 回滚完成即消失）。要严格保证一次
-    /// 停干净，调用方应先确认所有 `open` future 已结束，或对父级 `stop` 的 `Blocked`
-    /// 做一次重试。
+    /// 返回后保证：注册表里**不存在 `Running` 条目**，也不存在还在预算内的在飞工作。
+    /// 被孙级阻塞的子级以 `Blocked` 报告并保留 owner（[`Slot::Blocked`]），调用方须
+    /// 先回收那些孙级再重试 `close`。
     pub async fn close_all(&self, budget: Duration) -> CloseAllReport {
         // 置停机与取快照在同一临界区：这是「返回后不再出现可管理子级」的线性化点。
         let names: Vec<String> = {
@@ -511,22 +567,60 @@ impl ScopeRegistry {
 
         let mut report = CloseAllReport::default();
         for name in names {
+            if !self.settle_in_flight(&name, budget).await {
+                report
+                    .failed
+                    .push((name.clone(), RegistryError::Busy(name)));
+                continue;
+            }
             match self.close(&name, budget).await {
                 Ok(item) => report.closed.push((name, item)),
+                // 落定后名字已经不在表里：在飞 open 被停机挡下并自己回收了（或别的
+                // 调用方刚把它关掉）。这一格已收口，不算失败。
+                Err(RegistryError::NotFound(_)) => {}
                 Err(err) => report.failed.push((name, err)),
             }
         }
         report
     }
 
+    /// 等 `name` 上的在飞工作落定；`budget` 内没落定返回 `false`。
+    ///
+    /// 信号电平触发：已落定的立刻返回；被唤醒后**回到循环复查槽位**——槽位与信号
+    /// 总在同一临界区里一起迁移（落定 = 变成 `Running` / `Blocked`，或从表里消失），
+    /// 所以「唤醒了但槽位仍在飞」不会发生。
+    async fn settle_in_flight(&self, name: &str, budget: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let signal = {
+                let state = self.lock();
+                match state.entries.get(name) {
+                    Some(Slot::Reserved(signal) | Slot::Closing(signal)) => {
+                        Some(Arc::clone(signal))
+                    }
+                    _ => None,
+                }
+            };
+            let Some(signal) = signal else {
+                return true;
+            };
+            if tokio::time::timeout_at(deadline, signal.settled.wait())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
     /// 取出一个已存在作用域的只读句柄。
     ///
-    /// 只有 `Running` 才授出：`Reserved` 尚未启动，`Closing` 已进入不可逆的关闭流程
-    /// （拒绝新 `scope`/`spawn`），把它的句柄交给应用会造成误用。
+    /// 只有 `Running` 才授出：`Reserved` 尚未启动，`Closing` / `Blocked` 已进入不可逆
+    /// 的关闭流程（拒绝新 `scope`/`spawn`），把它的句柄交给应用会造成误用。
     pub fn get(&self, name: &str) -> Option<Context> {
         self.lock().entries.get(name).and_then(|slot| match slot {
             Slot::Running(runtime) => Some(runtime.handle()),
-            Slot::Reserved | Slot::Closing(_) => None,
+            Slot::Reserved(_) | Slot::Closing(_) | Slot::Blocked(_) => None,
         })
     }
 
@@ -587,6 +681,25 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 Ok(())
             })?;
+            Ok(())
+        }
+    }
+
+    /// `start` 卡在一道闸上：用来制造「在飞的 `open`」。
+    struct SlowStart {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Plugin for SlowStart {
+        fn name(&self) -> &'static str {
+            "slow-start"
+        }
+
+        async fn start(&self, _ctx: &Context) -> Result<(), Error> {
+            self.entered.notify_one();
+            self.release.notified().await;
             Ok(())
         }
     }
@@ -766,51 +879,46 @@ mod tests {
         });
     }
 
-    /// 在飞 `open` 与 `close_all` 交错：`close_all` 置停机后，那个已认领但尚未发布
-    /// 的 `open` 必须拒绝发布并自行回收，否则父层会被一条无人收口的租约永久阻塞。
+    /// 在飞 `open` 与 `close_all` 交错：`close_all` 先等这一轮落定（它已持有父级
+    /// 租约），到点后那个已认领却尚未发布的 `open` 必须拒绝发布并自行回收——父层
+    /// 因此不会被一条无人收口的租约挡住。
     #[test]
     fn open_during_close_all_cannot_publish() {
-        struct SlowStart {
-            entered: Arc<tokio::sync::Notify>,
-            release: Arc<tokio::sync::Notify>,
-        }
-
-        #[async_trait]
-        impl Plugin for SlowStart {
-            fn name(&self) -> &'static str {
-                "slow-start"
-            }
-
-            async fn start(&self, _ctx: &Context) -> Result<(), Error> {
-                self.entered.notify_one();
-                self.release.notified().await;
-                Ok(())
-            }
-        }
-
         block_on(async {
             let (mut root, registry) = fixture().await;
+            let registry = Arc::new(registry);
             let entered = Arc::new(tokio::sync::Notify::new());
             let release = Arc::new(tokio::sync::Notify::new());
 
-            // 先让 `open` 跑到插件的 `start`（此时名字是 `Reserved`、租约已存在），
-            // 再在同一任务里调 `close_all`——`Notify` 会保存 permit，顺序确定。
-            let (opened, _closed) = tokio::join!(
-                registry.open("late", {
-                    let entered = entered.clone();
-                    let release = release.clone();
-                    move |builder: &mut Builder| builder.plugin(SlowStart { entered, release })
-                }),
-                async {
-                    entered.notified().await;
-                    let report = registry.close_all(Duration::from_secs(1)).await;
-                    release.notify_one();
-                    report
-                }
+            let opening = {
+                let registry = Arc::clone(&registry);
+                let (entered, release) = (entered.clone(), release.clone());
+                tokio::spawn(async move {
+                    registry
+                        .open("late", move |builder: &mut Builder| {
+                            builder.plugin(SlowStart { entered, release })
+                        })
+                        .await
+                })
+            };
+            // 让它跑到插件的 `start`：名字已认领（`Reserved`）、父级租约已经产生。
+            entered.notified().await;
+
+            let closing = {
+                let registry = Arc::clone(&registry);
+                tokio::spawn(async move { registry.close_all(Duration::from_secs(5)).await })
+            };
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !closing.is_finished(),
+                "close_all 必须先等这条在飞的 open 落定"
             );
 
+            release.notify_one();
+            let report = closing.await.unwrap();
+            assert!(report.is_clean(), "{report:?}");
             assert!(
-                matches!(opened, Err(RegistryError::ShuttingDown)),
+                matches!(opening.await.unwrap(), Err(RegistryError::ShuttingDown)),
                 "停机后不得再发布作用域"
             );
             assert!(registry.get("late").is_none());
@@ -818,12 +926,55 @@ mod tests {
                 root.handle().children().is_empty(),
                 "被拒绝的 open 必须自行回收，父层租约归零"
             );
+            // 返回值就是保证：不会再有在飞的创建，父级一次就停得下来。
+            root.stop().await.into_result().unwrap();
+        });
+    }
+
+    /// 在飞工作超出预算：照实记 `Busy`，不冒充干净收口（此刻父级可能仍被欠着的
+    /// 租约挡住）——预算内没落定是本方法唯一不承诺的那一刻。
+    #[test]
+    fn close_all_reports_in_flight_work_that_outlives_the_budget() {
+        block_on(async {
+            let (mut root, registry) = fixture().await;
+            let registry = Arc::new(registry);
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+
+            let opening = {
+                let registry = Arc::clone(&registry);
+                let (entered, release) = (entered.clone(), release.clone());
+                tokio::spawn(async move {
+                    registry
+                        .open("late", move |builder: &mut Builder| {
+                            builder.plugin(SlowStart { entered, release })
+                        })
+                        .await
+                })
+            };
+            entered.notified().await;
+
+            let report = registry.close_all(Duration::from_millis(50)).await;
+            assert!(!report.is_clean(), "{report:?}");
+            assert!(
+                matches!(report.failed.as_slice(), [(name, RegistryError::Busy(_))] if name == "late"),
+                "{report:?}"
+            );
+
+            // 松闸后那一轮自己走完回滚：名字与租约都归还，父级随即停得下来。
+            release.notify_one();
+            assert!(matches!(
+                opening.await.unwrap(),
+                Err(RegistryError::ShuttingDown)
+            ));
+            assert!(registry.names().is_empty());
+            assert!(root.handle().children().is_empty());
             root.stop().await.into_result().unwrap();
         });
     }
 
     /// `close` 的 future 在 `stop` 的 await 点被取消：owner 不得被析构，名字不得
-    /// 永久 `Busy`——守卫把 `Runtime` 放回 `Closing(Some)`，重试即续跑。
+    /// 永久 `Busy`——守卫把 `Runtime` 放回 `Blocked`，重试即续跑。
     #[test]
     fn close_cancellation_keeps_scope_recoverable() {
         struct HangingStop {
@@ -936,7 +1087,7 @@ mod tests {
     }
 
     /// `open` 的启动失败回收停在 `stop` 的 await 点被取消：owner 同样不得被析构，
-    /// 名字也不得丢失——守卫把它放回 `Closing(Some)`，`close` 可续跑同一次清理。
+    /// 名字也不得丢失——守卫把它放回 `Blocked`，`close` 可续跑同一次清理。
     #[test]
     fn failed_start_cancellation_keeps_owner_recoverable() {
         struct FailThenHang {

@@ -512,9 +512,10 @@ root_rt.stop().await.into_result()?;
 要点：
 
 - **认领先于构建**：`open` 先在锁内占名，占住才 `ctx.scope()`；并发输家从未创建作用域，无需回滚。
-- **启动失败自动收干净**：半成品 `stop` + drop，名字释放可重试。**例外**：回收 `stop` 被活跃孙作用域 `Blocked` 时，owner 以 `Closing(Some)` 保留、名字不释放，再 `open` 同名得 `AlreadyExists`——先回收孙级，再对同名 `close` 续跑。
+- **启动失败自动收干净**：半成品 `stop` + drop，名字释放可重试。**例外**：回收 `stop` 被活跃孙作用域 `Blocked` 时，owner 以 `Blocked` 槽位保留、名字不释放，再 `open` 同名得 `AlreadyExists`——先回收孙级，再对同名 `close` 续跑。
 - **`Blocked` 不是终态**：被阻塞的子级仍由注册表持有（`Runtime` 不析构，插件 `stop` 不丢），回收孙级后重试 `close` 即续跑；期间 `get` 返回 `None`，并发 `close` 得 `RegistryError::Busy`。
-- **父级通常不会被 Blocked（前提是无在飞 `open`）**：`close_all` 串行关光全部子级，返回后不会再出现可管理的 `Running`。但一个已认领未发布的 `open` 可能已持有父级租约，要等它发布复查停机并回滚后才归还；这段窗口里停父级会瞬时 `Blocked`。要一次停干净，先确认所有 `open` future 已结束，或对父级 `stop` 重试。此时 `close_all` 会对该名字拿到 `Busy` 并计入 `failed`，`is_clean()` 为 `false`。
+- **`close_all` 先等在飞工作落定**：每个名字先等它上面的在飞 `open` / 并发 `close` 结束（在飞工作已经持有父级租约，落定才归还），再收口它。因此 `is_clean()` 的 `close_all` 返回后，父级立刻 `stop()` 不会再因在飞 `open` 瞬时 `Blocked`，不需要「先确认没有在飞创建」或对父级 `stop` 重试。没能在预算内落定的名字如实记 `RegistryError::Busy` 进 `failed`（`is_clean()` 为 `false`），该格不再继续收口。
+- **别让创建只活在会被强杀的任务里**：`stop_with_timeout` 预算到点强杀本层任务时，任务里正在 `await` 的 `open` 一并被砍——半成品只剩 `Drop` 一条路（插件 `stop`/dispose 不跑；debug 构建命中 `Runtime::drop` 的护栏）。要么让 `open` 跑完，要么把它的 future 交给不会被强杀的所有者持有到落定。
 - **所有权唯一**：注册表在 `Mutex` 里独占持有 `Runtime`，对外只给只读 `Context`，因此不可 `Clone`，但可按 `&self` 跨任务使用。查询用 `get(name)`（仅 `Running` 时授出）、`names()`、`is_shutting_down()`。
 - 需要 `tokio`（关闭预算用 `tokio::time`）；只依赖框架公开 API，可原样搬进独立 crate。
 
